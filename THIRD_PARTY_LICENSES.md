@@ -1,5 +1,10 @@
 # Third-party components
 
+> **Scope of the MIT license:** the `LICENSE` file (MIT) covers KakaPlayer's own
+> source code only. The packaged `.app` additionally bundles the components below,
+> each under its own license.
+
+
 KakaPlayer's own source code is MIT-licensed (see `LICENSE`). The packaged
 `.app` bundles or downloads at build time the following third-party components,
 each under its own license. Sources are linked so anyone can obtain and rebuild
