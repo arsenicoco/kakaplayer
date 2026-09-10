@@ -92,6 +92,36 @@ To cut a release (builds and publishes the DMG to GitHub):
 scripts/release.sh v0.1.0 "First public build"
 ```
 
+### Reclaiming disk space
+
+Everything the build produces or fetches is disposable and reproducible, so you
+can delete it any time to free space:
+
+- `build/` — Xcode DerivedData, the VLCKit download, the guest kernel, and the
+  engine image (several GB).
+- `dist/` — the built `.app` and `.dmg` (the DMG also lives on the
+  [Releases](https://github.com/arsenicoco/kakaplayer/releases) page).
+- The fetched bundle resources under `app/Packages/VLCKitBinary/` and
+  `app/KakaPlayer/Resources/` (all gitignored).
+
+```bash
+rm -rf build dist        # safe: nothing here is source
+```
+
+To rebuild afterwards, run **`scripts/bootstrap.sh` first** — it re-fetches every
+third-party component from upstream (VLCKit ≈ 900 MB, the Kata kernel, gvproxy)
+and rebuilds the engine image, then `scripts/build-app.sh` produces the app
+again:
+
+```bash
+scripts/bootstrap.sh     # re-creates build/ and the bundle resources
+scripts/build-app.sh     # -> dist/KakaPlayer.app and dist/KakaPlayer.dmg
+```
+
+`bootstrap.sh` is idempotent: it skips any component that's already present, so
+it's safe to re-run after a partial cleanup. The engine-image step needs Docker
+(OrbStack or Docker Desktop) running.
+
 ## Credits
 
 KakaPlayer stands on:
