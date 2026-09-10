@@ -15,6 +15,10 @@ struct KakaPlayerApp: App {
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .newItem) { }
+            CommandGroup(after: .help) {
+                Button("Keyboard Shortcuts") { appDelegate.model.showHelp.toggle() }
+                    .keyboardShortcut("/", modifiers: .command)
+            }
             CommandMenu("Engine") {
                 Button("Restart Engine") { appDelegate.model.shutdown(); appDelegate.model.startEngine() }
                 Button("Reset Engine Image…") { appDelegate.model.shutdown(); appDelegate.model.startEngine(reinstall: true) }

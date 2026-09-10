@@ -16,6 +16,7 @@ struct PlayerView: NSViewRepresentable {
     let url: URL?
     let attempt: Int
     let volume: Int32
+    let paused: Bool
     let onEvent: (PlayerEvent) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(onEvent: onEvent) }
@@ -41,7 +42,7 @@ struct PlayerView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        context.coordinator.update(url: url, attempt: attempt, volume: volume)
+        context.coordinator.update(url: url, attempt: attempt, volume: volume, paused: paused)
     }
 
     static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
@@ -52,6 +53,7 @@ struct PlayerView: NSViewRepresentable {
         private var player: VLCMediaPlayer?
         private var currentURL: URL?
         private var currentAttempt = -1
+        private var currentPaused = false
         private let onEvent: (PlayerEvent) -> Void
 
         init(onEvent: @escaping (PlayerEvent) -> Void) { self.onEvent = onEvent }
@@ -63,12 +65,13 @@ struct PlayerView: NSViewRepresentable {
             player = p
         }
 
-        func update(url: URL?, attempt: Int, volume: Int32) {
+        func update(url: URL?, attempt: Int, volume: Int32, paused: Bool) {
             guard let player else { return }
             player.audio?.volume = volume
             if url != currentURL || attempt != currentAttempt {
                 currentURL = url
                 currentAttempt = attempt
+                currentPaused = false
                 if let url, let media = VLCMedia(url: url) {
                     media.addOptions([
                         "network-caching": 3000,
@@ -80,6 +83,9 @@ struct PlayerView: NSViewRepresentable {
                 } else {
                     player.stop()
                 }
+            } else if paused != currentPaused, currentURL != nil {
+                currentPaused = paused
+                if paused { player.pause() } else { player.play() }
             }
         }
 

@@ -12,10 +12,20 @@ DIST="$ROOT/dist"
 RES="$APP_DIR/KakaPlayer/Resources"
 CONFIG="${CONFIG:-Release}"
 
+mkdir -p "$RES" "$DIST"
+
+# Kernel + engine image: prefer freshly-built copies from build/, but fall back to
+# whatever is already bundled in Resources (so a rebuild works after `rm -rf build`).
+[[ -f "$BUILD/kernel/vmlinux-arm64" ]] && cp -f "$BUILD/kernel/vmlinux-arm64" "$RES/vmlinux-arm64"
+if [[ -f "$BUILD/rootfs.img.xz" ]]; then
+  cp -f "$BUILD/rootfs.img.xz" "$RES/rootfs.img.xz"
+  shasum -a 256 "$BUILD/rootfs.img.xz" | cut -c1-16 > "$RES/rootfs.version"
+fi
+
 missing=0
 check() { [[ -e "$1" ]] || { echo "  missing: $1"; missing=1; }; }
-check "$BUILD/kernel/vmlinux-arm64"
-check "$BUILD/rootfs.img.xz"
+check "$RES/vmlinux-arm64"
+check "$RES/rootfs.img.xz"
 check "$APP_DIR/Packages/VLCKitBinary/VLCKit.xcframework/macos-arm64_x86_64"
 check "$RES/gvproxy"
 check "$RES/AppIcon.icns"
@@ -24,13 +34,7 @@ if [[ "$missing" == 1 ]]; then
   echo "Bundle resources are not set up. Run: scripts/bootstrap.sh"
   exit 1
 fi
-
-mkdir -p "$RES" "$DIST"
-cp -f "$BUILD/kernel/vmlinux-arm64" "$RES/vmlinux-arm64"
-cp -f "$BUILD/rootfs.img.xz" "$RES/rootfs.img.xz"
-# Version stamp: the app re-extracts the image when this changes.
-shasum -a 256 "$BUILD/rootfs.img.xz" | cut -c1-16 > "$RES/rootfs.version"
-echo "rootfs version: $(cat "$RES/rootfs.version")"
+echo "rootfs version: $(cat "$RES/rootfs.version" 2>/dev/null || echo '?')"
 
 cd "$APP_DIR"
 xcodegen generate --quiet

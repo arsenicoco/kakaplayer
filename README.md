@@ -50,6 +50,22 @@ the first channel takes 20–40 seconds. Later launches are fast.
 - During playback the controls fade out when the mouse is idle and return on
   movement; double-click the video (or the ⤢ button) for full screen.
 
+### Keyboard shortcuts
+
+| Key | Action |
+|-----|--------|
+| `Space` | Play / pause |
+| `F` | Full screen |
+| `S` | Stop |
+| `M` | Mute |
+| `↑` / `↓` | Volume up / down |
+| `↩` | Play the link in the field |
+| `Esc` | Exit full screen |
+| `?` | Show / hide the shortcuts cheatsheet |
+
+Single-key shortcuts are ignored while you're typing in the link field, so they
+never get in the way of pasting a link.
+
 ## How it works
 
 ```

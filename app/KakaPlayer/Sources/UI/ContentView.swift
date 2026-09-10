@@ -3,9 +3,8 @@ import AppKit
 
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
-    @State private var volume: Double = 100
-    @State private var muted = false
     @State private var showChrome = true
+    @State private var keyMonitor: Any?
     @State private var hideWork: DispatchWorkItem?
     @State private var showVolume = false
     @FocusState private var linkFocused: Bool
@@ -22,7 +21,7 @@ struct ContentView: View {
         .background(alignment: .center) {
             ZStack {
                 Theme.bg
-                PlayerView(url: model.playbackURL, attempt: model.playbackAttempt, volume: muted ? 0 : Int32(volume)) { event in
+                PlayerView(url: model.playbackURL, attempt: model.playbackAttempt, volume: model.muted ? 0 : Int32(model.volume), paused: model.isPaused) { event in
                     model.playerEvent(event)
                 }
                 .opacity(model.playbackURL == nil ? 0 : 1)
@@ -30,11 +29,13 @@ struct ContentView: View {
                 centerState.padding(.horizontal, 40)
             }
         }
+        .overlay { pausedOverlay }
         .overlay {
             if model.showLog {
                 logPanel.transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
+        .overlay { if model.showHelp { helpOverlay.transition(.opacity) } }
         .frame(minWidth: 820, minHeight: 520)
         .ignoresSafeArea()
         .background(WindowConfigurator())
@@ -50,8 +51,10 @@ struct ContentView: View {
         .onChange(of: model.showLog) { _, on in if on { model.refreshLogSnapshot() }; bumpChrome() }
         .onAppear {
             linkFocused = model.currentLink == nil
+            installKeyMonitor()
             bumpChrome()
         }
+        .onDisappear { removeKeyMonitor() }
     }
 
     // MARK: Chrome (scrim + bars), fades together on idle
@@ -119,6 +122,9 @@ struct ContentView: View {
 
             volumeControl
             iconButton("arrow.up.left.and.arrow.down.right") { toggleFullScreen() }
+            iconButton("questionmark.circle", active: model.showHelp) {
+                withAnimation(.easeInOut(duration: 0.2)) { model.showHelp.toggle() }
+            }
             iconButton("terminal", active: model.showLog) {
                 withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) { model.showLog.toggle() }
             }
@@ -152,18 +158,18 @@ struct ContentView: View {
     }
 
     private var volumeControl: some View {
-        iconButton(muted || volume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill", active: showVolume) {
+        iconButton(model.muted || model.volume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill", active: showVolume) {
             showVolume.toggle()
         }
         .popover(isPresented: $showVolume, arrowEdge: .bottom) {
             HStack(spacing: 12) {
-                Button { muted.toggle() } label: {
-                    Image(systemName: muted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                Button { model.toggleMute() } label: {
+                    Image(systemName: model.muted ? "speaker.slash.fill" : "speaker.wave.2.fill")
                         .foregroundStyle(Theme.textSecondary)
                 }.buttonStyle(.plain)
-                Slider(value: $volume, in: 0...150) { editing in if editing { muted = false } }
+                Slider(value: $model.volume, in: 0...150) { editing in if editing { model.muted = false } }
                     .frame(width: 160)
-                Text("\(Int(volume))")
+                Text("\(Int(model.volume))")
                     .font(Theme.rounded(12, .medium).monospacedDigit())
                     .foregroundStyle(Theme.textSecondary)
                     .frame(width: 30, alignment: .trailing)
@@ -371,6 +377,103 @@ struct ContentView: View {
     }
 
     private func toggleFullScreen() { NSApp.keyWindow?.toggleFullScreen(nil) }
+
+    // MARK: Keyboard shortcuts
+
+    private func installKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            handleKey(event)
+        }
+    }
+
+    private func removeKeyMonitor() {
+        if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
+    }
+
+    /// Handles bare single-key shortcuts, but never while the link field is being
+    /// edited (so typing works) and never for ⌘/⌥/⌃ combos (so menu items work).
+    private func handleKey(_ event: NSEvent) -> NSEvent? {
+        if let r = NSApp.keyWindow?.firstResponder, r is NSText || r.isKind(of: NSTextView.self) {
+            return event
+        }
+        if !event.modifierFlags.intersection([.command, .option, .control]).isEmpty { return event }
+        let fullscreen = NSApp.keyWindow?.styleMask.contains(.fullScreen) ?? false
+        var handled = true
+        switch event.keyCode {
+        case 49: model.togglePlayPause()          // space
+        case 3:  toggleFullScreen()               // f
+        case 1:  model.stopPlayback()             // s
+        case 46: model.toggleMute()               // m
+        case 126: model.nudgeVolume(5)            // up arrow
+        case 125: model.nudgeVolume(-5)           // down arrow
+        case 53:                                  // esc
+            if model.showHelp { model.showHelp = false }
+            else if fullscreen { toggleFullScreen() }
+            else { handled = false }
+        default:
+            if event.charactersIgnoringModifiers == "?" { model.showHelp.toggle() }
+            else { handled = false }
+        }
+        if handled { bumpChrome(); return nil }
+        return event
+    }
+
+    // MARK: Paused & help overlays
+
+    @ViewBuilder private var pausedOverlay: some View {
+        if model.isPaused, model.playbackURL != nil {
+            ZStack {
+                Color.black.opacity(0.25)
+                Image(systemName: "pause.fill")
+                    .font(.system(size: 44, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .padding(26)
+                    .background(.ultraThinMaterial, in: Circle())
+                    .overlay(Circle().strokeBorder(Theme.stroke, lineWidth: 1))
+            }
+            .allowsHitTesting(false)
+            .transition(.opacity)
+        }
+    }
+
+    private var helpOverlay: some View {
+        let rows: [(String, String)] = [
+            ("Space", "Play / Pause"),
+            ("F", "Full screen"),
+            ("S", "Stop"),
+            ("M", "Mute"),
+            ("↑ / ↓", "Volume up / down"),
+            ("↩", "Play the link in the field"),
+            ("Esc", "Exit full screen"),
+            ("?", "Show / hide this help"),
+        ]
+        return ZStack {
+            Color.black.opacity(0.4).ignoresSafeArea()
+                .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { model.showHelp = false } }
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Keyboard shortcuts")
+                    .font(Theme.rounded(16, .bold)).foregroundStyle(Theme.textPrimary)
+                VStack(spacing: 8) {
+                    ForEach(rows, id: \.0) { key, desc in
+                        HStack(spacing: 14) {
+                            Text(key)
+                                .font(Theme.rounded(12, .semibold).monospaced())
+                                .foregroundStyle(Theme.textPrimary)
+                                .frame(minWidth: 54)
+                                .padding(.vertical, 4).padding(.horizontal, 8)
+                                .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                            Text(desc).font(Theme.rounded(13)).foregroundStyle(Theme.textSecondary)
+                            Spacer(minLength: 0)
+                        }
+                    }
+                }
+            }
+            .padding(26)
+            .frame(width: 340)
+            .glass(cornerRadius: 22, strong: true)
+        }
+    }
 
     private func bumpChrome() {
         showChrome = true

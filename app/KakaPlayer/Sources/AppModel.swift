@@ -67,6 +67,31 @@ final class AppModel: ObservableObject {
     @Published var linkText: String = ""
     @Published var pendingLink: AceLink?   // opened before engine was ready
     @Published var showLog = false
+    @Published var showHelp = false
+
+    // Audio / transport, driven by the toolbar and keyboard shortcuts.
+    @Published var volume: Double = 100
+    @Published var muted = false
+    @Published var isPaused = false
+
+    /// Space: pause/resume if a stream is up; otherwise start the current link.
+    func togglePlayPause() {
+        if playbackURL != nil {
+            isPaused.toggle()
+        } else if let link = currentLink {
+            play(link)
+        } else {
+            let t = linkText.trimmingCharacters(in: .whitespaces)
+            if !t.isEmpty { open(t) }
+        }
+    }
+
+    func toggleMute() { muted.toggle() }
+
+    func nudgeVolume(_ delta: Double) {
+        muted = false
+        volume = min(150, max(0, volume + delta))
+    }
 
     let api = AceStreamAPI()
     private let vm = VMController()
@@ -229,6 +254,7 @@ final class AppModel: ObservableObject {
         }
         let previous = session
         session = nil
+        isPaused = false
         statsTask?.cancel()
         relay?.stop(); relay = nil
         playbackURL = nil
@@ -314,6 +340,7 @@ final class AppModel: ObservableObject {
         playerWatchdog?.cancel()
         playerWatchdog = nil
         stats = nil
+        isPaused = false
         if let s = session {
             session = nil
             Task { await api.stop(s) }
