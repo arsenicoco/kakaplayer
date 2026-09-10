@@ -1,0 +1,23 @@
+# Build outputs
+build/
+dist/
+*.dmg
+
+# Xcode project is generated from project.yml by XcodeGen
+app/KakaPlayer.xcodeproj/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+
+# Fetched / built bundle resources (reproduced by scripts/bootstrap.sh)
+app/Packages/VLCKitBinary/VLCKit.xcframework/
+app/KakaPlayer/Resources/vmlinux-arm64
+app/KakaPlayer/Resources/rootfs.img.xz
+app/KakaPlayer/Resources/rootfs.version
+app/KakaPlayer/Resources/gvproxy
+app/KakaPlayer/Resources/AppIcon.icns
+app/KakaPlayer/Resources/AppMark.png
+
+# Scratch
+icon_transparent.png
+*.tar.xz
+.DS_Store

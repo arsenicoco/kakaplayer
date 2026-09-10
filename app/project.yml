@@ -1,0 +1,65 @@
+name: KakaPlayer
+options:
+  bundleIdPrefix: dev.kakaplayer
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+  xcodeVersion: "26.3"
+packages:
+  VLCKitBinary:
+    path: Packages/VLCKitBinary
+targets:
+  KakaPlayer:
+    type: application
+    platform: macOS
+    sources:
+      - path: KakaPlayer/Sources
+      - path: KakaPlayer/Resources
+        buildPhase: resources
+    dependencies:
+      - package: VLCKitBinary
+        product: VLCKit
+      - sdk: Virtualization.framework
+    entitlements:
+      path: KakaPlayer/KakaPlayer.entitlements
+      properties:
+        com.apple.security.virtualization: true
+    info:
+      path: KakaPlayer/Info.plist
+      properties:
+        CFBundleName: KakaPlayer
+        CFBundleIconFile: AppIcon
+        CFBundleDisplayName: KakaPlayer
+        CFBundleIdentifier: dev.kakaplayer.KakaPlayer
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        LSMinimumSystemVersion: "26.0"
+        LSApplicationCategoryType: public.app-category.video
+        NSHumanReadableCopyright: "MIT. Bundles VLCKit (LGPL 2.1) and the Ace Stream engine (Ace Stream user agreement)."
+        NSHighResolutionCapable: true
+        NSSupportsAutomaticTermination: false
+        NSSupportsSuddenTermination: false
+        CFBundleURLTypes:
+          - CFBundleURLName: Ace Stream link
+            CFBundleURLSchemes: [acestream]
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Owner
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.kakaplayer.KakaPlayer
+        SWIFT_VERSION: "5"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        DEVELOPMENT_TEAM: ""
+        ENABLE_HARDENED_RUNTIME: false
+        ENABLE_APP_SANDBOX: false
+        ARCHS: arm64
+        ONLY_ACTIVE_ARCH: true
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+        GENERATE_INFOPLIST_FILE: false
+        ENABLE_USER_SCRIPT_SANDBOXING: false
+        SWIFT_OBJC_INTEROP_MODE: objc

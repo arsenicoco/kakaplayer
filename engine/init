@@ -1,0 +1,237 @@
+#!/opt/bb/busybox sh
+#
+# KakaPlayer VM init (PID 1).
+#
+# Runs as the kernel's `init=/init`.  At this point Rosetta binfmt_misc is NOT
+# yet registered, so *nothing* x86_64 can be executed: the shebang above and
+# every command below must be the native aarch64 static busybox from /opt/bb.
+# Only after the binfmt registration succeeds may amd64 binaries (socat, the
+# Ace Stream engine) be started.
+#
+# Expected kernel cmdline: console=hvc0 root=/dev/vda rw init=/init
+
+PATH=/opt/bb:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+export HOME=/root
+export TERM=linux
+export LANG=C.UTF-8
+export PYTHONUNBUFFERED=1
+
+log() { echo "KAKA-INIT: $*"; }
+warn() { echo "KAKA-INIT: WARNING: $*"; }
+
+log "starting (busybox $(busybox | head -1 | cut -d' ' -f2), $(uname -m))"
+
+# ---------------------------------------------------------------------------
+# 1. Pseudo filesystems
+# ---------------------------------------------------------------------------
+mount -t proc     proc     /proc            2>/dev/null || true
+mount -t sysfs    sysfs    /sys             2>/dev/null || true
+mount -t devtmpfs devtmpfs /dev             2>/dev/null || true
+
+mkdir -p /dev/pts /dev/shm /run /tmp /var/log /var/cache/acestream /var/lib/acestream
+
+mount -t devpts devpts /dev/pts             2>/dev/null || true
+mount -t tmpfs -o size=1024m tmpfs /dev/shm 2>/dev/null || true
+mount -t tmpfs  tmpfs /run                  2>/dev/null || true
+mount -t tmpfs  tmpfs /tmp                  2>/dev/null || true
+chmod 1777 /tmp /dev/shm 2>/dev/null || true
+
+mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null \
+    || warn "could not mount binfmt_misc (already mounted or not supported)"
+
+# Root is /dev/vda ext4; the kernel cmdline says `rw` but remount anyway so a
+# read-only fallback mount is corrected.
+mount -o remount,rw / 2>/dev/null || warn "remount,rw / failed"
+
+# ---------------------------------------------------------------------------
+# 2. Identity
+# ---------------------------------------------------------------------------
+echo kakaplayer > /etc/hostname
+hostname kakaplayer 2>/dev/null || true
+grep -q kakaplayer /etc/hosts 2>/dev/null || {
+    echo "127.0.0.1 localhost" > /etc/hosts
+    echo "127.0.1.1 kakaplayer" >> /etc/hosts
+}
+
+# ---------------------------------------------------------------------------
+# 3. Rosetta: virtiofs mount + binfmt_misc registration
+# ---------------------------------------------------------------------------
+ROSETTA_OK=0
+mkdir -p /run/rosetta
+if mount -t virtiofs rosetta /run/rosetta 2>/dev/null; then
+    log "rosetta virtiofs mounted at /run/rosetta"
+    if [ -x /run/rosetta/rosetta ]; then
+        # Magic/mask select ELF64 little-endian EM_X86_64 (e_machine 0x3e).
+        # Flags OCF: O=open binary at registration, C=credentials from binary,
+        # F=load the interpreter now (survives later namespace/mount changes).
+        # The kernel expects the *escaped* form (literal \x7f... text); raw NUL
+        # bytes truncate the record and leave a broken catch-all entry behind.
+        # busybox printf returns 1 for this write even on success, so verify by
+        # reading the entry back instead of trusting the exit status.
+        printf '%s\n' ':rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/run/rosetta/rosetta:OCF' \
+            > /proc/sys/fs/binfmt_misc/register 2>/dev/null
+        if grep -q '^enabled' /proc/sys/fs/binfmt_misc/rosetta 2>/dev/null; then
+            log "rosetta binfmt_misc registered (x86_64 -> /run/rosetta/rosetta)"
+            ROSETTA_OK=1
+        else
+            warn "FAILED to register rosetta binfmt_misc handler"
+        fi
+    else
+        warn "/run/rosetta/rosetta is missing or not executable"
+    fi
+else
+    warn "FAILED to mount virtiofs tag 'rosetta' at /run/rosetta"
+fi
+
+if [ "$ROSETTA_OK" != "1" ]; then
+    warn "x86_64 binaries (socat, Ace Stream engine) will NOT run; continuing anyway"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Networking
+# ---------------------------------------------------------------------------
+# The host normally passes a static configuration on the kernel cmdline
+# (kaka.ip=192.168.77.2/24 kaka.gw=192.168.77.1 kaka.dns=1.1.1.1,8.8.8.8),
+# because macOS's on-demand DHCP server (bootpd) can take minutes to answer.
+# Without those parameters we fall back to busybox udhcpc.
+ip link set lo up 2>/dev/null || true
+ip link set eth0 up 2>/dev/null || warn "no eth0 interface"
+
+# /etc/resolv.conf must be a writable regular file, never a dangling symlink.
+[ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
+
+KAKA_IP=""; KAKA_GW=""; KAKA_DNS=""
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+        kaka.ip=*)  KAKA_IP="${arg#kaka.ip=}" ;;
+        kaka.gw=*)  KAKA_GW="${arg#kaka.gw=}" ;;
+        kaka.dns=*) KAKA_DNS="${arg#kaka.dns=}" ;;
+    esac
+done
+
+VM_IP=""
+if [ -n "$KAKA_IP" ]; then
+    ip addr flush dev eth0 2>/dev/null
+    if ip addr add "$KAKA_IP" dev eth0 2>/dev/null; then
+        VM_IP="${KAKA_IP%/*}"
+        [ -n "$KAKA_GW" ] && ip route add default via "$KAKA_GW" dev eth0 2>/dev/null
+        {
+            for d in $(echo "$KAKA_DNS" | tr ',' ' '); do echo "nameserver $d"; done
+            [ -n "$KAKA_GW" ] && echo "nameserver $KAKA_GW"
+            [ -z "$KAKA_DNS" ] && printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+            echo "options timeout:2 attempts:2"
+        } > /etc/resolv.conf
+        log "static network $KAKA_IP gw=${KAKA_GW:-none} dns=${KAKA_DNS:-default}"
+    else
+        warn "could not assign static address $KAKA_IP; falling back to DHCP"
+    fi
+fi
+
+configure_static() {
+    # $1 = ip/prefix, $2 = gateway, $3 = comma-separated DNS list (optional)
+    ip addr flush dev eth0 2>/dev/null
+    ip addr add "$1" dev eth0 2>/dev/null || return 1
+    ip route replace default via "$2" dev eth0 2>/dev/null
+    {
+        for d in $(echo "$3" | tr ',' ' '); do echo "nameserver $d"; done
+        echo "nameserver $2"
+        echo "nameserver 1.1.1.1"
+        echo "options timeout:2 attempts:2"
+    } > /etc/resolv.conf
+    VM_IP="${1%/*}"
+    log "static network $1 gw=$2 dns=${3:-$2}"
+}
+
+if [ -z "$VM_IP" ]; then
+    [ -s /etc/resolv.conf ] || printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf
+    # DHCP in the background (-f keeps udhcpc alive for renewals); its output goes
+    # to the console so the host log shows what happened.
+    udhcpc -i eth0 -s /etc/udhcpc.sh -f -t 8 -T 1 -A 3 2>&1 | sed 's/^/KAKA-DHCP: /' &
+    # Meanwhile the host may push "KAKA-NET <ip/prefix> <gateway> [dns,dns]" on the
+    # console once it has discovered the NAT bridge subnet; whichever arrives
+    # first wins. macOS's on-demand DHCP server can take minutes to answer.
+    i=0
+    while [ $i -lt 30 ]; do
+        VM_IP=$(ip -4 -o addr show dev eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+        [ -n "$VM_IP" ] && { log "dhcp lease $VM_IP"; break; }
+        line=""
+        if read -t 1 -r line < /dev/console 2>/dev/null; then
+            case "$line" in
+                KAKA-NET\ *)
+                    set -- $line
+                    configure_static "$2" "$3" "$4" && break
+                    ;;
+            esac
+        fi
+        i=$((i + 1))
+    done
+    [ -n "$VM_IP" ] || warn "no network config after ~30s (udhcpc keeps retrying in the background)"
+fi
+
+log "network up ${VM_IP:-none}"
+
+# ---------------------------------------------------------------------------
+# 5. Time (best effort, non-fatal) - the RTC is usually already correct
+# ---------------------------------------------------------------------------
+(
+    ntpd -q -n -p pool.ntp.org >/dev/null 2>&1 &
+    NTPPID=$!
+    n=0
+    while [ $n -lt 15 ] && kill -0 $NTPPID 2>/dev/null; do sleep 1; n=$((n + 1)); done
+    kill -9 $NTPPID 2>/dev/null
+) >/dev/null 2>&1 &
+log "date $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+# ---------------------------------------------------------------------------
+# 6. vsock bridges (socat is an amd64 binary -> must come AFTER binfmt)
+# ---------------------------------------------------------------------------
+# 6878: host -> guest HTTP API of the Ace Stream engine.
+socat VSOCK-LISTEN:6878,fork,reuseaddr TCP:127.0.0.1:6878 &
+log "vsock bridge 6878 -> 127.0.0.1:6878 started (pid $!)"
+
+# 6880: host connects here to request a clean poweroff.
+socat VSOCK-LISTEN:6880,fork,reuseaddr EXEC:'/opt/bb/busybox sh /opt/kaka/poweroff.sh' &
+log "vsock shutdown listener 6880 started (pid $!)"
+
+# ---------------------------------------------------------------------------
+# 7. Ace Stream engine supervision loop
+# ---------------------------------------------------------------------------
+ENGINE=/opt/acestream/start-engine
+LOG=/var/log/acestream.log
+: > "$LOG"
+
+ENGINE_ARGS="--client-console --http-port 6878 --bind-all"
+ENGINE_ARGS="$ENGINE_ARGS --cache-dir /var/cache/acestream"
+ENGINE_ARGS="$ENGINE_ARGS --state-dir /var/lib/acestream"
+ENGINE_ARGS="$ENGINE_ARGS --cache-limit 2"
+ENGINE_ARGS="$ENGINE_ARGS --log-stdout --log-stdout-level info"
+
+# Live-cache tuning.  3.2.11 does NOT have a `--live-cache-size` option (its
+# --help lists --live-mem-cache-size / --live-disk-cache-size instead), so the
+# real flag name is probed and only appended when the engine advertises it.
+if "$ENGINE" --help 2>&1 | grep -q -- '--live-cache-type'; then
+    ENGINE_ARGS="$ENGINE_ARGS --live-cache-type memory"
+    if "$ENGINE" --help 2>&1 | grep -q -- '--live-mem-cache-size'; then
+        ENGINE_ARGS="$ENGINE_ARGS --live-mem-cache-size 200000000"
+    elif "$ENGINE" --help 2>&1 | grep -q -- '--live-cache-size'; then
+        ENGINE_ARGS="$ENGINE_ARGS --live-cache-size 200000000"
+    else
+        log "engine accepts no live cache size flag; omitted"
+    fi
+else
+    log "engine does not accept --live-cache-type; live cache flags omitted"
+fi
+
+cd /var/lib/acestream 2>/dev/null || cd /
+
+log "engine args: $ENGINE_ARGS"
+log "engine loop starting"
+
+while true; do
+    {
+        "$ENGINE" $ENGINE_ARGS
+        echo "KAKA-INIT: engine exited $?"
+    } 2>&1 | tee -a "$LOG"
+    sleep 2
+done
