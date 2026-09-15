@@ -207,6 +207,11 @@ final class MobileModel: ObservableObject {
                 for attempt in 0..<3 {
                     do { info = try await api.startStream(link); break }
                     catch let error as URLError {
+                        // URLSession reports a cancelled task as URLError(.cancelled), not
+                        // CancellationError, so stopping or switching links mid-start would
+                        // otherwise look like an unreachable engine and overwrite the state
+                        // the caller just set.
+                        if Task.isCancelled || error.code == .cancelled { return }
                         lastErr = error
                         appendLog("[play] start failed to reach the engine: \(error.localizedDescription)")
                         break
@@ -218,6 +223,7 @@ final class MobileModel: ObservableObject {
                         try? await Task.sleep(for: .seconds(2))
                     }
                 }
+                guard !Task.isCancelled else { return }
                 guard let info else {
                     if let transport = lastErr as? URLError {
                         engineStatus = .unreachable(transport.localizedDescription)
@@ -252,13 +258,13 @@ final class MobileModel: ObservableObject {
                                             self.appendLog("[play] upstream ended: \(reason)")
                                             // In the foreground this is usually the engine dropping the
                                             // reader mid-stream, and one silent restart beats an error
-                                            // card. Deaths seen while backgrounded are left to
-                                            // `sceneDidBecomeActive`, which reads `upstreamDied` — the
-                                            // delegate callback lands after the .active phase, so the
-                                            // resume hook cannot be the one to notice them.
-                                            if self.sceneActive, self.wasPlaying, self.autoRestarts < 1,
-                                               let link = self.currentLink {
-                                                self.autoRestarts += 1
+                                            // card; it also covers a socket iOS killed while suspended,
+                                            // which is only reported once we are back. `wasPlaying` is
+                                            // the cap — play() clears it, so the restarted session has
+                                            // to show video again before it earns another restart.
+                                            // Deaths noticed before that go to `upstreamDied`, which
+                                            // `sceneDidBecomeActive` picks up.
+                                            if self.sceneActive, self.wasPlaying, let link = self.currentLink {
                                                 self.appendLog("[play] restarting \(link.displayName) after the upstream died")
                                                 self.play(link)
                                                 return
@@ -297,7 +303,6 @@ final class MobileModel: ObservableObject {
         relay = nil
         upstreamDied = false
         wasPlaying = false
-        autoRestarts = 0
         playerHasPlayed = false
         playerRetries = 0
         playerWatchdog?.cancel()
@@ -320,9 +325,6 @@ final class MobileModel: ObservableObject {
     /// Whether the scene is in the foreground, so an upstream death can be told apart from
     /// one that happened while suspended.
     private var sceneActive = true
-    /// Automatic restarts since video last appeared; capped so a stream the engine keeps
-    /// closing cannot loop.
-    private var autoRestarts = 0
 
     func playerEvent(_ event: PlayerEvent) {
         guard playbackURL != nil else { return }
@@ -332,7 +334,6 @@ final class MobileModel: ObservableObject {
         case .playing:
             playerHasPlayed = true
             wasPlaying = true
-            autoRestarts = 0
             playerRetries = 0
             playerWatchdog?.cancel()
             playerWatchdog = nil
