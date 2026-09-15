@@ -81,10 +81,11 @@ plays the stream over Wi-Fi.
    under Settings › Privacy & Security › Local Network.)
 5. Paste an `acestream://…` link, or open one from Safari or Messages.
 
-Three things worth knowing:
+Notes:
 
 - The Mac only accepts connections from private network addresses
-  (10/8, 172.16/12, 192.168/16). Anything else is refused.
+  (10/8, 172.16/12, 192.168/16, and link-local 169.254/16). Anything else,
+  including VPN ranges such as 100.64/10, is refused.
 - There is no password in this version. Anyone on your network can use the
   shared engine while the toggle is on.
 - The Mac and the phone each start their own engine session, so playing on one
@@ -121,8 +122,10 @@ DEVELOPMENT_TEAM=ABCDE12345 scripts/build-ios.sh  # device
 
 - The Mac has to be awake and on the same network; the phone plays nothing on
   its own.
-- No remote access outside the LAN. A VPN such as Tailscale works, as long as it
-  presents the Mac under a private address.
+- No remote access outside the LAN. The Mac refuses connections from any
+  non-private address, including the 100.64/10 range Tailscale uses, so a VPN
+  only works if it gives the phone a 10/8, 172.16/12 or 192.168/16 address (for
+  example a Tailscale subnet router on the Mac's LAN).
 - Background playback keeps the audio going while a stream is playing; it does
   not start or resume one in the background.
 - Lock-screen and call-interruption behaviour has not been tested on a physical
@@ -205,8 +208,8 @@ rm -rf build dist        # safe: nothing here is source
 ```
 
 To rebuild afterwards, run **`scripts/bootstrap.sh` first** — it re-fetches every
-third-party component from upstream (VLCKit ≈ 1.3 GB unpacked, now that it
-carries the macOS and iOS slices, plus the Kata kernel and gvproxy)
+third-party component from upstream (VLCKit ≈ 1.3 GB unpacked with the macOS and
+iOS slices, the Kata kernel, gvproxy)
 and rebuilds the engine image, then `scripts/build-app.sh` produces the app
 again:
 
