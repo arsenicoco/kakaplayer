@@ -30,6 +30,15 @@ final class MobileModel: ObservableObject {
         var isReachable: Bool { if case .reachable = self { return true } else { return false } }
     }
 
+    enum MobileError: LocalizedError {
+        case engineUnreachable(String)
+        var errorDescription: String? {
+            switch self {
+            case .engineUnreachable(let detail): return "Engine unreachable: \(detail)"
+            }
+        }
+    }
+
     enum PlaybackState: Equatable {
         case stopped
         case starting
@@ -176,6 +185,10 @@ final class MobileModel: ObservableObject {
         playbackURL = nil
         upstreamDied = false
         playerHasPlayed = false
+        // A restarted session has to earn `wasPlaying` again: until video shows, an
+        // inactive→active hop must not mistake "still starting" for "died in the
+        // background" and cancel the start that is already in flight.
+        wasPlaying = false
         playerRetries = 0
         playerWatchdog?.cancel(); playerWatchdog = nil
         stats = nil
@@ -185,11 +198,19 @@ final class MobileModel: ObservableObject {
             do {
                 if let previous { await api.stop(previous); try? await Task.sleep(for: .milliseconds(400)) }
                 guard !Task.isCancelled else { return }
-                // The engine can be briefly busy right after switching torrents; retry the start.
+                // The engine can be briefly busy right after switching torrents; retry the
+                // start. A transport failure is different: the engine is not there at all
+                // (wrong address, wrong Wi-Fi), and three 30-second connect timeouts would
+                // leave the user staring at "Starting…" for a minute and a half.
                 var info: AceStreamAPI.PlaybackInfo?
                 var lastErr: Error?
                 for attempt in 0..<3 {
                     do { info = try await api.startStream(link); break }
+                    catch let error as URLError {
+                        lastErr = error
+                        appendLog("[play] start failed to reach the engine: \(error.localizedDescription)")
+                        break
+                    }
                     catch {
                         lastErr = error
                         appendLog("[play] start attempt \(attempt + 1) failed: \(error.localizedDescription)")
@@ -197,7 +218,13 @@ final class MobileModel: ObservableObject {
                         try? await Task.sleep(for: .seconds(2))
                     }
                 }
-                guard let info else { throw lastErr ?? AceStreamAPI.APIError.badResponse }
+                guard let info else {
+                    if let transport = lastErr as? URLError {
+                        engineStatus = .unreachable(transport.localizedDescription)
+                        throw MobileError.engineUnreachable(transport.localizedDescription)
+                    }
+                    throw lastErr ?? AceStreamAPI.APIError.badResponse
+                }
                 guard !Task.isCancelled else { await api.stop(info); return }
                 session = info
                 appendLog("[play] session \(info.playback_session_id ?? "?") live=\(info.is_live ?? -1) url=\(info.playback_url)")
@@ -221,8 +248,23 @@ final class MobileModel: ObservableObject {
                                     relay.onUpstreamEnded = { [weak self] err in
                                         Task { @MainActor in
                                             guard let self, self.relay === relay else { return }
+                                            let reason = err == nil ? "The engine closed the stream." : "Engine connection lost: \(err!.localizedDescription)"
+                                            self.appendLog("[play] upstream ended: \(reason)")
+                                            // In the foreground this is usually the engine dropping the
+                                            // reader mid-stream, and one silent restart beats an error
+                                            // card. Deaths seen while backgrounded are left to
+                                            // `sceneDidBecomeActive`, which reads `upstreamDied` — the
+                                            // delegate callback lands after the .active phase, so the
+                                            // resume hook cannot be the one to notice them.
+                                            if self.sceneActive, self.wasPlaying, self.autoRestarts < 1,
+                                               let link = self.currentLink {
+                                                self.autoRestarts += 1
+                                                self.appendLog("[play] restarting \(link.displayName) after the upstream died")
+                                                self.play(link)
+                                                return
+                                            }
                                             self.upstreamDied = true
-                                            self.playbackState = .error(err == nil ? "The engine closed the stream." : "Engine connection lost: \(err!.localizedDescription)")
+                                            self.playbackState = .error(reason)
                                         }
                                     }
                                     try relay.start(upstream: upstream)
@@ -255,6 +297,7 @@ final class MobileModel: ObservableObject {
         relay = nil
         upstreamDied = false
         wasPlaying = false
+        autoRestarts = 0
         playerHasPlayed = false
         playerRetries = 0
         playerWatchdog?.cancel()
@@ -274,6 +317,12 @@ final class MobileModel: ObservableObject {
     private var upstreamDied = false
     /// A session got as far as showing video, so resuming should try to bring it back.
     private var wasPlaying = false
+    /// Whether the scene is in the foreground, so an upstream death can be told apart from
+    /// one that happened while suspended.
+    private var sceneActive = true
+    /// Automatic restarts since video last appeared; capped so a stream the engine keeps
+    /// closing cannot loop.
+    private var autoRestarts = 0
 
     func playerEvent(_ event: PlayerEvent) {
         guard playbackURL != nil else { return }
@@ -283,6 +332,7 @@ final class MobileModel: ObservableObject {
         case .playing:
             playerHasPlayed = true
             wasPlaying = true
+            autoRestarts = 0
             playerRetries = 0
             playerWatchdog?.cancel()
             playerWatchdog = nil
@@ -315,6 +365,7 @@ final class MobileModel: ObservableObject {
     // MARK: Scene lifecycle
 
     func scenePhaseChanged(_ phase: ScenePhase) {
+        sceneActive = phase == .active
         switch phase {
         case .active: sceneDidBecomeActive()
         case .background: appendLog("[app] entered background")
@@ -323,13 +374,16 @@ final class MobileModel: ObservableObject {
     }
 
     /// iOS closes idle sockets while an app is suspended, which kills the relay's upstream
-    /// connection to the engine. If a session had been playing, restart it from scratch on
-    /// the way back in — the engine session is cheap to re-open and the alternative is a
-    /// frozen picture.
+    /// connection to the engine. If a session that had been playing lost its upstream,
+    /// restart it from scratch on the way back in — the engine session is cheap to re-open
+    /// and the alternative is a frozen picture.
+    ///
+    /// Only a *confirmed* death restarts: a live relay on an inactive→active hop (Control
+    /// Centre, the notification shade, a call) must be left alone, and so must a session
+    /// that is still starting.
     func sceneDidBecomeActive() {
         if engineURL != nil, !engineStatus.isReachable { checkEngine() }
-        guard wasPlaying, let link = currentLink else { return }
-        guard upstreamDied || relay == nil else { return }
+        guard wasPlaying, upstreamDied, let link = currentLink else { return }
         appendLog("[app] resumed with a dead stream, restarting \(link.displayName)")
         play(link)
     }

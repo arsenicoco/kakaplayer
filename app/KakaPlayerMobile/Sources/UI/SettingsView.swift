@@ -17,8 +17,34 @@ struct SettingsView: View {
         case failed(String)
     }
 
-    private var portNumber: Int { Int(port.trimmingCharacters(in: .whitespaces)) ?? MobileModel.defaultPort }
-    private var canSave: Bool { !host.trimmingCharacters(in: .whitespaces).isEmpty }
+    private var typedPort: Int { Int(port.trimmingCharacters(in: .whitespaces)) ?? MobileModel.defaultPort }
+    /// The address the fields actually mean, with a pasted scheme, path or `:port` folded in.
+    private var address: (host: String, port: Int) {
+        let parsed = Self.normalize(host)
+        return (parsed.host, parsed.port ?? typedPort)
+    }
+    private var canSave: Bool { !address.host.isEmpty }
+
+    /// Takes what people really paste — `192.168.1.10`, `http://192.168.1.10:6878/`,
+    /// `[fe80::1]:6878` — and splits it into a bare host plus a port when one is spelled out,
+    /// so the engine URL is not built from something `URL` would reject.
+    static func normalize(_ raw: String) -> (host: String, port: Int?) {
+        var s = raw.trimmingCharacters(in: .whitespaces)
+        for scheme in ["http://", "https://"] {
+            if let r = s.range(of: scheme, options: [.caseInsensitive, .anchored]) {
+                s = String(s[r.upperBound...])
+            }
+        }
+        if let slash = s.firstIndex(of: "/") { s = String(s[..<slash]) }
+        if s.hasPrefix("["), let close = s.firstIndex(of: "]") {           // [IPv6] or [IPv6]:port
+            let literal = String(s[s.index(after: s.startIndex)..<close])
+            let rest = s[s.index(after: close)...]
+            return (literal, rest.hasPrefix(":") ? Int(rest.dropFirst()) : nil)
+        }
+        let parts = s.split(separator: ":", omittingEmptySubsequences: false)
+        if parts.count == 2, let port = Int(parts[1]) { return (String(parts[0]), port) }
+        return (s, nil)                                                    // host, or a bare IPv6 literal
+    }
 
     var body: some View {
         NavigationStack {
@@ -70,7 +96,7 @@ struct SettingsView: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
-                        model.setEngine(host: host, port: portNumber)
+                        model.setEngine(host: address.host, port: address.port)
                         dismiss()
                     }
                     .disabled(!canSave)
@@ -116,10 +142,10 @@ struct SettingsView: View {
     /// before it replaces a working setting.
     @MainActor
     private func test() {
-        let trimmed = host.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return }
-        let literal = trimmed.contains(":") && !trimmed.hasPrefix("[") ? "[\(trimmed)]" : trimmed
-        guard let url = URL(string: "http://\(literal):\(portNumber)") else {
+        let address = self.address
+        guard !address.host.isEmpty else { return }
+        let literal = address.host.contains(":") ? "[\(address.host)]" : address.host
+        guard let url = URL(string: "http://\(literal):\(address.port)") else {
             testResult = .failed("That host does not look like an address.")
             return
         }

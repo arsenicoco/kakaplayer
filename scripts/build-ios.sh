@@ -22,6 +22,10 @@ SIMULATOR="${SIMULATOR:-KakaTest}"
 DERIVED="$BUILD/DerivedData-ios"
 PACKAGES="$BUILD/SourcePackages"
 
+command -v xcodegen >/dev/null || {
+  echo "xcodegen is not installed. Run: brew install xcodegen"
+  exit 1
+}
 [[ -d "$APP_DIR/Packages/VLCKitBinary/VLCKit.xcframework" ]] || {
   echo "VLCKit.xcframework is missing. Run: scripts/fetch-vlckit.sh"
   exit 1
@@ -29,7 +33,8 @@ PACKAGES="$BUILD/SourcePackages"
 
 # Creates the simulator on first run: first available iPhone device type, newest iOS runtime.
 ensure_simulator() {
-  if xcrun simctl list devices | grep -q " $SIMULATOR ("; then return; fi
+  # `available` only: a device on a deleted runtime still lists, but cannot be built for.
+  if xcrun simctl list devices available | grep -q " $SIMULATOR ("; then return; fi
   local device_type runtime
   device_type="$(xcrun simctl list devicetypes --json \
     | /usr/bin/python3 -c 'import json,sys; ts=[t for t in json.load(sys.stdin)["devicetypes"] if "iPhone" in t["name"]]; print(ts[0]["identifier"] if ts else "")')"
@@ -46,7 +51,9 @@ xcodegen generate --quiet
 if [[ -n "${DEVELOPMENT_TEAM:-}" ]]; then
   echo "building for a device with team $DEVELOPMENT_TEAM"
   DESTINATION='generic/platform=iOS'
-  SIGNING=(CODE_SIGN_STYLE=Automatic "DEVELOPMENT_TEAM=$DEVELOPMENT_TEAM")
+  # -allowProvisioningUpdates: no profile for dev.kakaplayer.mobile exists until Xcode
+  # creates one, and without this the first device build just fails asking for it.
+  SIGNING=(-allowProvisioningUpdates CODE_SIGN_STYLE=Automatic "DEVELOPMENT_TEAM=$DEVELOPMENT_TEAM")
   PRODUCT_DIR="$DERIVED/Build/Products/$CONFIG-iphoneos"
 else
   ensure_simulator
