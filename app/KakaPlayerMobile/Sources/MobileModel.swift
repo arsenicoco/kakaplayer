@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import SwiftUI
 import UIKit
@@ -46,6 +47,15 @@ final class MobileModel: ObservableObject {
         case playing
         case error(String)
 
+        /// A session is on its way but has no video yet, so there is nothing to pause and
+        /// nothing to restart.
+        var isStartingUp: Bool {
+            switch self {
+            case .starting, .prebuffering: return true
+            default: return false
+            }
+        }
+
         var label: String {
             switch self {
             case .stopped: return "Idle"
@@ -68,6 +78,48 @@ final class MobileModel: ObservableObject {
     @Published private(set) var logLines: [String] = []
     @Published var linkText: String = ""
     @Published var showSettings = false
+
+    // MARK: Audio / transport
+    //
+    // Mirrors the Mac app's `AppModel`: the floating controls and the hardware keyboard
+    // drive these, and `PlayerView` hands them to VLCKit.
+
+    /// Software volume, 0…100. Persisted, so the level survives a relaunch.
+    /// The Mac app allows up to 150; iOS keeps to 100 because the hardware keys and the
+    /// Control Centre slider sit on top of it, and amplified output just clips.
+    @Published var volume: Double {
+        didSet { defaults.set(volume, forKey: Self.volumeDefaultsKey) }
+    }
+    @Published var muted = false
+    @Published var isPaused = false
+
+    static let maxVolume: Double = 100
+    static let volumeDefaultsKey = "player.volume"
+
+    /// Space / the play-pause button: resume or pause a live stream, otherwise start one.
+    func togglePlayPause() {
+        if playbackURL != nil {
+            isPaused.toggle()
+        } else if playbackState.isStartingUp {
+            // A session is already on its way. Restarting it would cancel the start that is
+            // in flight and tell the engine to drop a torrent it is still opening, which
+            // reads as the button making things slower.
+            return
+        } else if let link = currentLink {
+            play(link)
+        } else {
+            let text = linkText.trimmingCharacters(in: .whitespaces)
+            if !text.isEmpty { open(text) }
+        }
+    }
+
+    func toggleMute() { muted.toggle() }
+
+    /// Nudges the volume and un-mutes, so pressing "louder" while muted does the obvious thing.
+    func nudgeVolume(_ delta: Double) {
+        muted = false
+        volume = min(Self.maxVolume, max(0, volume + delta))
+    }
 
     // Engine address, persisted in UserDefaults.
     @Published private(set) var engineHost: String
@@ -100,6 +152,9 @@ final class MobileModel: ObservableObject {
     private var relay: StreamRelay?
     private var statsTask: Task<Void, Never>?
     private var checkTask: Task<Void, Never>?
+    /// The in-flight "tell the engine this session is over" request. Held so that anyone
+    /// retiring the client it runs on can wait for it instead of invalidating underneath it.
+    private var stopTask: Task<Void, Never>?
     private let maxLogLines = 500
     private var logBuffer: [String] = []
     private var logFlushTask: Task<Void, Never>?
@@ -109,9 +164,18 @@ final class MobileModel: ObservableObject {
         engineHost = defaults.string(forKey: Self.hostDefaultsKey) ?? ""
         let storedPort = defaults.integer(forKey: Self.portDefaultsKey)
         enginePort = storedPort > 0 ? storedPort : Self.defaultPort
+        // `object(forKey:)`, not `double(forKey:)`: the latter cannot tell "never set"
+        // from a deliberate 0, and would start every fresh install silent.
+        let storedVolume = defaults.object(forKey: Self.volumeDefaultsKey) as? Double
+        volume = storedVolume.map { min(Self.maxVolume, max(0, $0)) } ?? Self.maxVolume
         api = engineURL.map { AceStreamAPI(baseURL: $0, pid: Self.clientPID) }
         engineStatus = api == nil ? .notConfigured : .checking
         VLCLogBridge.sink = { [weak self] line in Task { @MainActor in self?.appendLog(line) } }
+        observeAudioInterruptions()
+    }
+
+    deinit {
+        if let interruptionObserver { NotificationCenter.default.removeObserver(interruptionObserver) }
     }
 
     // MARK: Engine settings
@@ -120,12 +184,46 @@ final class MobileModel: ObservableObject {
     func setEngine(host: String, port: Int) {
         let host = host.trimmingCharacters(in: .whitespaces)
         let port = (1...65535).contains(port) ? port : Self.defaultPort
+        let previousURL = engineURL
+        let previousAPI = api
         engineHost = host
         enginePort = port
         defaults.set(host, forKey: Self.hostDefaultsKey)
         defaults.set(port, forKey: Self.portDefaultsKey)
+        // Saving the same address again (the common case: open Settings, look, Save) must
+        // not churn the client — a rebuilt one would drop the engine's keep-alive
+        // connections and give the stream a stall for nothing.
+        guard engineURL != previousURL else {
+            checkEngine()
+            return
+        }
+        // A stream belonging to the old engine cannot outlive the address change: the
+        // stats poll and the relay both talk to a host we are no longer pointed at. Stop
+        // it *before* the old client is retired — `invalidate()` is only safe once nothing
+        // can start another request on that session, and a request started on an
+        // invalidated session raises an Objective-C NSGenericException that Swift cannot
+        // catch, i.e. it takes the process down rather than throwing.
+        let pendingStats = statsTask
+        if session != nil || statsTask != nil {
+            appendLog("[app] engine address changed while streaming, stopping playback")
+            stopPlayback(keepLink: true)
+        }
         api = engineURL.map { AceStreamAPI(baseURL: $0, pid: Self.clientPID) }
         appendLog("[app] engine set to \(engineURL?.absoluteString ?? "none")")
+        // Cancelling is cooperative and `stopPlayback` leaves its "tell the engine to
+        // stop" request in flight, so wait for everything still holding a copy of the old
+        // client before retiring the session under it. `checkTask` is captured here, ahead
+        // of the `checkEngine()` below that replaces it: two quick changes of address in a
+        // row would otherwise invalidate a client whose probe had not issued its request
+        // yet, and a request started on an invalidated session kills the process.
+        let pendingStop = stopTask
+        let pendingCheck = checkTask
+        Task {
+            _ = await pendingStats?.value
+            _ = await pendingStop?.value
+            _ = await pendingCheck?.value
+            previousAPI?.invalidate()
+        }
         checkEngine()
     }
 
@@ -155,7 +253,13 @@ final class MobileModel: ObservableObject {
 
     /// One-shot reachability probe used by `checkEngine` and by Settings' "Test connection",
     /// which needs the result without disturbing the published status.
-    static func probe(_ api: AceStreamAPI) async -> Result<String, Error> {
+    ///
+    /// Pass `disposable: true` for a client built only for this probe — a typed-but-unsaved
+    /// address, say — and the probe finishes its URLSession afterwards. Without that,
+    /// testing an address a dozen times leaves a dozen live sessions behind. The model's
+    /// own long-lived client must never be probed that way.
+    static func probe(_ api: AceStreamAPI, disposable: Bool = false) async -> Result<String, Error> {
+        defer { if disposable { api.invalidate() } }
         do { return .success(try await api.version().version) } catch { return .failure(error) }
     }
 
@@ -178,6 +282,14 @@ final class MobileModel: ObservableObject {
             return
         }
         currentLink = link
+        // Claim the audio route before anything opens the player, so the first frames are
+        // audible and the [audio] background mode keeps the stream alive behind the lock
+        // screen rather than being cut off mid-handshake.
+        activateAudioSession()
+        isPaused = false
+        // A new session is not the one an interruption paused, so an interruption ending
+        // later must not "resume" it on top of whatever the user has since asked for.
+        pausedByInterruption = false
         let previous = session
         session = nil
         statsTask?.cancel()
@@ -205,6 +317,10 @@ final class MobileModel: ObservableObject {
                 var info: AceStreamAPI.PlaybackInfo?
                 var lastErr: Error?
                 for attempt in 0..<3 {
+                    // Re-checked here, not only before the sleep below: `try?` swallows the
+                    // sleep's cancellation, and a start issued after that point would put a
+                    // fresh request on a client the caller may already be retiring.
+                    guard !Task.isCancelled else { return }
                     do { info = try await api.startStream(link); break }
                     catch let error as URLError {
                         // URLSession reports a cancelled task as URLError(.cancelled), not
@@ -296,6 +412,7 @@ final class MobileModel: ObservableObject {
     }
 
     func stopPlayback(keepLink: Bool = false) {
+        let hadPlayer = playbackURL != nil
         statsTask?.cancel()
         statsTask = nil
         playbackURL = nil
@@ -308,10 +425,119 @@ final class MobileModel: ObservableObject {
         playerWatchdog?.cancel()
         playerWatchdog = nil
         stats = nil
-        if let s = session, let api { Task { await api.stop(s) } }
+        if let s = session, let api { stopTask = Task { await api.stop(s) } }
         session = nil
+        isPaused = false
+        pausedByInterruption = false
+        // The audio route goes back when the *player* reports `.stopped`, not here:
+        // `playbackURL` has only just been cleared, so VLC is still rendering and will not
+        // let go until SwiftUI's next pass — deactivating now fails with "is busy". If
+        // there was no player at all, there is nothing to wait for.
+        if hadPlayer { scheduleAudioRelease() } else { deactivateAudioSession() }
         playbackState = .stopped
         if !keepLink { currentLink = nil }
+    }
+
+    // MARK: Audio session
+
+    /// Whether this app currently holds an active audio session, so it is deactivated
+    /// exactly once and other apps are not told to resume when nothing was playing.
+    private var audioSessionActive = false
+    /// Set when an interruption (a call, Siri, another player) paused us, so only a pause
+    /// *we* caused is undone when the interruption ends.
+    private var pausedByInterruption = false
+    private var interruptionObserver: NSObjectProtocol?
+    /// Retries the hand-back after a stop, for the case where the player never reports in.
+    private var audioReleaseTask: Task<Void, Never>?
+
+    /// `.playback` / `.moviePlayback`: audio keeps going when the ringer switch is silent
+    /// or the screen locks, which is the whole point of the `audio` background mode.
+    private func activateAudioSession() {
+        audioReleaseTask?.cancel()
+        audioReleaseTask = nil
+        guard !audioSessionActive else { return }
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playback, mode: .moviePlayback)
+            try session.setActive(true)
+            audioSessionActive = true
+        } catch {
+            appendLog("[audio] could not activate the audio session: \(error.localizedDescription)")
+        }
+    }
+
+    /// `.notifyOthersOnDeactivation` hands the route back, so music that was ducked or
+    /// paused for us starts again instead of leaving the device silent.
+    private func deactivateAudioSession() {
+        guard audioSessionActive else { return }
+        do {
+            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            audioSessionActive = false
+            appendLog("[audio] released the audio route")
+        } catch {
+            // `audioSessionActive` deliberately stays set. This almost always fails with
+            // `AVAudioSessionErrorCodeIsBusy` — the player has not finished letting go of
+            // the route — and clearing the flag here would mean nothing ever retries and
+            // the other app is never told it may resume.
+            appendLog("[audio] could not deactivate the audio session: \(error.localizedDescription)")
+        }
+    }
+
+    /// Keeps asking for a short while after a stop.
+    ///
+    /// The player only really releases the route on a later SwiftUI pass, and if no player
+    /// is on screen at all it never reports back — without this the route would stay
+    /// claimed for the rest of the app's life. Ends as soon as the hand-back succeeds.
+    private func scheduleAudioRelease() {
+        audioReleaseTask?.cancel()
+        audioReleaseTask = Task { [weak self] in
+            for _ in 0..<10 {
+                try? await Task.sleep(for: .milliseconds(300))
+                guard !Task.isCancelled, let self, self.audioSessionActive else { return }
+                self.deactivateAudioSession()
+            }
+        }
+    }
+
+    private func observeAudioInterruptions() {
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: nil
+        ) { [weak self] note in
+            // Read the payload here — the notification itself does not cross to the actor.
+            guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+            let options = (note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt)
+                .map(AVAudioSession.InterruptionOptions.init(rawValue:)) ?? []
+            let shouldResume = options.contains(.shouldResume)
+            Task { @MainActor in self?.audioInterrupted(type, shouldResume: shouldResume) }
+        }
+    }
+
+    private func audioInterrupted(_ type: AVAudioSession.InterruptionType, shouldResume: Bool) {
+        switch type {
+        case .began:
+            guard playbackURL != nil, !isPaused else { return }
+            appendLog("[audio] interrupted, pausing playback")
+            pausedByInterruption = true
+            isPaused = true
+        case .ended:
+            guard pausedByInterruption else { return }
+            pausedByInterruption = false
+            guard shouldResume else {
+                appendLog("[audio] interruption ended without shouldResume, staying paused")
+                return
+            }
+            // The system deactivated our session for the duration; claim it again before
+            // telling the player to run, or the picture resumes with no sound.
+            appendLog("[audio] interruption ended, resuming playback")
+            audioSessionActive = false
+            activateAudioSession()
+            isPaused = false
+        @unknown default:
+            break
+        }
     }
 
     private var playerHasPlayed = false
@@ -323,13 +549,34 @@ final class MobileModel: ObservableObject {
     /// A session got as far as showing video, so resuming should try to bring it back.
     private var wasPlaying = false
     /// Whether the scene is in the foreground, so an upstream death can be told apart from
-    /// one that happened while suspended.
-    private var sceneActive = true
+    /// one that happened while suspended. Published because the UI stops its auto-hide
+    /// timer (and anything else that only makes sense on screen) while we are away.
+    @Published private(set) var sceneActive = true
 
     func playerEvent(_ event: PlayerEvent) {
+        // Ahead of the guard: `.stopped` is the player acknowledging a teardown we asked
+        // for, so `playbackURL` is nil by the time it arrives. It is also the first moment
+        // the audio route can actually be handed back.
+        if case .stopped = event {
+            appendLog("[vlc] player released the media")
+            // Only when playback is really over. A restart — a different link, an upstream
+            // death, coming back from the background — clears `playbackURL` too, so the
+            // player reports `.stopped` for the *old* stream after `play()` has already
+            // claimed the audio route for the new one. Releasing it here would leave the
+            // new stream running with no route. `stopPlayback` sets `.stopped` before the
+            // event can arrive; `play()` sets `.starting`.
+            guard playbackState == .stopped else { return }
+            audioReleaseTask?.cancel()
+            audioReleaseTask = nil
+            deactivateAudioSession()
+            return
+        }
         guard playbackURL != nil else { return }
         switch event {
         case .opening, .buffering:
+            break
+        case .stopped:
+            // Unreachable: handled above, before the guard.
             break
         case .playing:
             playerHasPlayed = true

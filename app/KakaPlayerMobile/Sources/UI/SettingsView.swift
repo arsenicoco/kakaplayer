@@ -281,7 +281,10 @@ struct SettingsView: View {
         testing = true
         testResult = .none
         Task {
-            let result = await MobileModel.probe(AceStreamAPI(baseURL: url, pid: MobileModel.clientPID))
+            // `disposable`: this client exists only for the tap, so its URLSession is
+            // finished afterwards instead of being left behind on every test.
+            let result = await MobileModel.probe(
+                AceStreamAPI(baseURL: url, pid: MobileModel.clientPID), disposable: true)
             testing = false
             switch result {
             case .success(let version): testResult = .ok(version)
