@@ -204,8 +204,8 @@ struct ContentView: View {
                         .foregroundStyle(Theme.textSecondary)
                         .lineLimit(1).truncationMode(.middle)
                 }
-                if model.lanSharingEnabled {
-                    sharingLine
+                if model.lanSharingEnabled, let address = model.lanAddress {
+                    sharingLine(address)
                 }
             }
             if case .failed = model.engineState {
@@ -231,10 +231,10 @@ struct ContentView: View {
 
     /// Shown under the engine status while the engine is shared on the LAN, so the
     /// address to type on a phone is visible without opening a menu.
-    private var sharingLine: some View {
+    private func sharingLine(_ address: String) -> some View {
         HStack(spacing: 5) {
             Image(systemName: "wifi").font(.system(size: 9, weight: .semibold))
-            Text(model.lanAddress.map { "Shared on \($0)" } ?? "Sharing on the local network")
+            Text("Shared on \(address)")
                 .font(Theme.rounded(10.5, .medium).monospacedDigit())
                 .lineLimit(1)
                 .textSelection(.enabled)

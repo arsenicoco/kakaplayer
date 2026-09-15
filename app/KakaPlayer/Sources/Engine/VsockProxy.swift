@@ -126,9 +126,9 @@ final class VsockProxy {
         rejectedPeers.removeAll()
         lanLock.unlock()
         guard fd >= 0 else { return }
-        // `shutdown` first so the accept thread wakes up instead of blocking on a
-        // file descriptor number that may be reused.
-        shutdown(fd, SHUT_RDWR)
+        // Closing the descriptor is what makes the blocked accept() return; shutdown()
+        // on a listening socket is a no-op on macOS. The accept loop then sees
+        // `lanFD < 0` and exits.
         close(fd)
         lanAcceptThread = nil
         log("[proxy] stopped sharing on 0.0.0.0:\(hostPort)")
@@ -147,14 +147,22 @@ final class VsockProxy {
                 ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { accept(fd, $0, &len) }
             }
             if client < 0 {
-                if errno == EINTR { continue }
-                return
+                switch errno {
+                case EINTR, ECONNABORTED:
+                    continue   // the client gave up before we got to it
+                case EMFILE, ENFILE:
+                    // Out of descriptors: back off instead of spinning on the error.
+                    usleep(100_000)
+                    continue
+                default:
+                    return
+                }
             }
             // Ask the kernel for the peer rather than trusting the address accept()
             // filled in, and drop anything that is not on a private network.
-            guard let peer = Self.peerIPv4(of: client), Self.isPrivateIPv4(peer) else {
-                let who = Self.peerIPv4(of: client).map(Self.describe) ?? "unknown address"
-                noteRejection(who)
+            let peer = Self.peerIPv4(of: client)
+            guard let peer, Self.isPrivateIPv4(peer) else {
+                noteRejection(peer.map(Self.describe) ?? "unknown address")
                 close(client)
                 continue
             }

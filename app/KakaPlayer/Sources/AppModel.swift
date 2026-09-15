@@ -130,6 +130,10 @@ final class AppModel: ObservableObject {
                 self.appendLog("[vm] state: \(Self.describe(state))")
                 if state == .stopped || state == .error, self.engineState.isReady || self.engineState == .waitingForEngine || self.engineState == .booting {
                     self.engineState = .failed("virtual machine stopped unexpectedly")
+                    // The proxy this was sharing is dead: drop the LAN listener and the
+                    // advertisement rather than pointing the network at a stopped VM.
+                    // The toggle is untouched, so sharing returns on the next `.ready`.
+                    self.stopLANSharing()
                 }
             }
         }
@@ -243,8 +247,7 @@ final class AppModel: ObservableObject {
     /// only run once the engine answers, so the toggle is re-applied on every start.
     private func applyLANSharing() {
         guard lanSharingEnabled else {
-            lanSharing.stop()
-            lanAddress = nil
+            stopLANSharing()
             return
         }
         guard case .ready(let version) = engineState, let proxy else {
@@ -265,10 +268,16 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func shutdown() {
-        stopPlayback()
+    /// Tears sharing down without touching the toggle, so it comes back by itself
+    /// the next time the engine reports ready.
+    private func stopLANSharing() {
         lanSharing.stop()
         lanAddress = nil
+    }
+
+    func shutdown() {
+        stopPlayback()
+        stopLANSharing()
         proxy?.stop()
         proxy = nil
         vm.shutdown()
