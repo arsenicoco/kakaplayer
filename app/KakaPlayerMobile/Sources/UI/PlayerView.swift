@@ -9,6 +9,10 @@ enum PlayerEvent {
     case buffering
     case ended
     case error
+    /// The player has actually released the media and the audio hardware. Distinct from
+    /// `.ended`: `.ended` is the stream finishing on its own, this is the teardown the
+    /// model asked for completing, which is the point at which the audio session can go.
+    case stopped
 }
 
 /// Thin SwiftUI wrapper around VLCKit's VLCMediaPlayer drawing into a plain UIView.
@@ -65,6 +69,7 @@ struct PlayerView: UIViewRepresentable {
             player.audio?.volume = volume
             applyFit(aspectFill, to: player)
             if url != currentURL || attempt != currentAttempt {
+                let previousURL = currentURL
                 currentURL = url
                 currentAttempt = attempt
                 currentPaused = false
@@ -82,6 +87,12 @@ struct PlayerView: UIViewRepresentable {
                     applyFit(aspectFill, to: player)
                 } else {
                     player.stop()
+                    // `stop()` is synchronous but the delegate callback below is filtered
+                    // out once `currentURL` is nil, so tell the model here: it is waiting
+                    // for this before it gives the audio route back. Only when something
+                    // was actually open — the first `update` of a fresh player also lands
+                    // here (no url yet, attempt 0 vs -1) and that is not a teardown.
+                    if previousURL != nil { onEvent(.stopped) }
                 }
             } else if paused != currentPaused, currentURL != nil {
                 currentPaused = paused
@@ -106,7 +117,12 @@ struct PlayerView: UIViewRepresentable {
         }
 
         func mediaPlayerStateChanged(_ newState: VLCMediaPlayerState) {
-            guard currentURL != nil else { return }
+            guard currentURL != nil else {
+                // Torn down already: the only state still worth forwarding is the player
+                // confirming it has let go, which may land after `update` asked it to stop.
+                if newState == .stopped { onEvent(.stopped) }
+                return
+            }
             switch newState {
             case .opening: onEvent(.opening)
             case .playing: onEvent(.playing)
