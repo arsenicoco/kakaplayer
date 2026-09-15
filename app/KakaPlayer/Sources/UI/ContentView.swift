@@ -195,13 +195,18 @@ struct ContentView: View {
 
     private var bottomBar: some View {
         HStack(spacing: 14) {
-            HStack(spacing: 8) {
-                Circle().fill(engineColor).frame(width: 8, height: 8)
-                    .shadow(color: engineColor.opacity(0.7), radius: 4)
-                Text(model.engineState.label)
-                    .font(Theme.rounded(12, .medium))
-                    .foregroundStyle(Theme.textSecondary)
-                    .lineLimit(1).truncationMode(.middle)
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 8) {
+                    Circle().fill(engineColor).frame(width: 8, height: 8)
+                        .shadow(color: engineColor.opacity(0.7), radius: 4)
+                    Text(model.engineState.label)
+                        .font(Theme.rounded(12, .medium))
+                        .foregroundStyle(Theme.textSecondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+                if model.lanSharingEnabled, let address = model.lanAddress {
+                    sharingLine(address)
+                }
             }
             if case .failed = model.engineState {
                 Button("Retry") { model.startEngine() }
@@ -222,6 +227,20 @@ struct ContentView: View {
             }
         }
         .frame(height: 34)
+    }
+
+    /// Shown under the engine status while the engine is shared on the LAN, so the
+    /// address to type on a phone is visible without opening a menu.
+    private func sharingLine(_ address: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: "wifi").font(.system(size: 9, weight: .semibold))
+            Text("Shared on \(address)")
+                .font(Theme.rounded(10.5, .medium).monospacedDigit())
+                .lineLimit(1)
+                .textSelection(.enabled)
+        }
+        .foregroundStyle(Theme.textTertiary)
+        .padding(.leading, 16)   // line up with the engine label, past the status dot
     }
 
     private var liveBadge: some View {
