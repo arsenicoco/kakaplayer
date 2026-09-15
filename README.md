@@ -66,6 +66,71 @@ the first channel takes 20–40 seconds. Later launches are fast.
 Single-key shortcuts are ignored while you're typing in the link field, so they
 never get in the way of pasting a link.
 
+## iPhone and iPad
+
+There is a companion iOS app. It is a thin client: it has no engine of its own.
+The engine keeps running inside KakaPlayer on the Mac, and the phone or iPad
+plays the stream over Wi-Fi.
+
+1. On the Mac, turn on **Engine → Share Engine on Local Network**.
+2. If macOS's firewall asks, allow incoming connections for KakaPlayer.
+3. Keep the Mac awake and on the same Wi-Fi as the phone.
+4. Open KakaPlayer on the phone. It finds the Mac automatically over Bonjour —
+   or open **Settings** and type `<mac-ip>:6878` by hand. (The first search asks
+   for the Local Network permission; if you decline it, re-enable KakaPlayer
+   under Settings › Privacy & Security › Local Network.)
+5. Paste an `acestream://…` link, or open one from Safari or Messages.
+
+Notes:
+
+- The Mac only accepts connections from private network addresses
+  (10/8, 172.16/12, 192.168/16, and link-local 169.254/16). Anything else,
+  including VPN ranges such as 100.64/10, is refused.
+- There is no password in this version. Anyone on your network can use the
+  shared engine while the toggle is on.
+- The Mac and the phone each start their own engine session, so playing on one
+  does not interrupt the other.
+
+### Install on your iPhone or iPad
+
+The app is not on the App Store. Install it from source with Xcode:
+
+```bash
+brew install xcodegen
+scripts/bootstrap.sh     # fetches VLCKit with the iOS slices, and the rest
+cd app && xcodegen generate
+open KakaPlayer.xcodeproj
+```
+
+In Xcode: select the **KakaPlayerMobile** scheme, add your Apple ID under
+**Xcode → Settings → Accounts**, pick your personal team under **Signing &
+Capabilities**, plug the device in and press Run. On the phone, trust the
+developer under **Settings → General → VPN & Device Management**.
+
+A free Apple ID signs the app for 7 days, after which you re-run it from Xcode
+to re-sign. A paid developer account gives you a year.
+
+`scripts/build-ios.sh` builds the same target from the command line — the iOS
+Simulator by default, or a device build with a signing team:
+
+```bash
+scripts/build-ios.sh                              # simulator
+DEVELOPMENT_TEAM=ABCDE12345 scripts/build-ios.sh  # device
+```
+
+### Known limitations
+
+- The Mac has to be awake and on the same network; the phone plays nothing on
+  its own.
+- No remote access outside the LAN. The Mac refuses connections from any
+  non-private address, including the 100.64/10 range Tailscale uses, so a VPN
+  only works if it gives the phone a 10/8, 172.16/12 or 192.168/16 address (for
+  example a Tailscale subnet router on the Mac's LAN).
+- Background playback keeps the audio going while a stream is playing; it does
+  not start or resume one in the background.
+- Lock-screen and call-interruption behaviour has not been tested on a physical
+  device yet.
+
 ## How it works
 
 ```
@@ -76,12 +141,24 @@ KakaPlayer.app
 └── rootfs.img.xz         Ubuntu 22.04 + the official Ace Stream engine 3.2.11
 ```
 
+The sources are split three ways, so the two apps share one engine client:
+
+```
+app/
+├── KakaPlayer/          the Mac app: the VM, the engine, the player
+├── KakaPlayerMobile/    the iOS app: SwiftUI + VLCKit, Bonjour discovery
+└── Shared/              engine client + stream relay, used by both
+```
+
 1. A tiny Linux VM boots on Apple's **Virtualization.framework**, with **Rosetta**
    shared in so the x86_64 engine runs on Apple Silicon.
 2. The guest exposes the engine's HTTP API to the Mac over **vsock**, so it looks
    exactly like a local Ace Stream install on `127.0.0.1:6878`.
 3. A small in-app relay holds a single connection to the engine and fans the
    stream out to the embedded **VLCKit** player.
+4. With LAN sharing on, the Mac opens a second listener on the same port for
+   private addresses only and advertises itself as `_kakaplayer._tcp` over
+   Bonjour, so the iOS app finds it without anyone typing an IP address.
 
 More detail lives in [`engine/README.md`](engine/README.md).
 
@@ -101,6 +178,12 @@ open dist/KakaPlayer.app
 `bootstrap.sh` pulls every third-party component straight from its upstream, so
 nothing proprietary is stored in this repo. Only the engine-image step needs
 Docker, and only at build time.
+
+The iOS client (`KakaPlayerMobile`) is a second target in the same Xcode project
+and needs no extra setup — `bootstrap.sh` already fetches the iOS slices of
+VLCKit. `scripts/build-ios.sh` builds it for the Simulator, or for a device when
+`DEVELOPMENT_TEAM` is set; see
+[Install on your iPhone or iPad](#install-on-your-iphone-or-ipad).
 
 To cut a release (builds and publishes the DMG to GitHub):
 
@@ -125,7 +208,8 @@ rm -rf build dist        # safe: nothing here is source
 ```
 
 To rebuild afterwards, run **`scripts/bootstrap.sh` first** — it re-fetches every
-third-party component from upstream (VLCKit ≈ 900 MB, the Kata kernel, gvproxy)
+third-party component from upstream (VLCKit ≈ 1.3 GB unpacked with the macOS and
+iOS slices, the Kata kernel, gvproxy)
 and rebuilds the engine image, then `scripts/build-app.sh` produces the app
 again:
 
