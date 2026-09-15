@@ -14,6 +14,9 @@ targets:
     platform: macOS
     sources:
       - path: KakaPlayer/Sources
+      # Platform-agnostic engine client, shared with the upcoming iOS app.
+      # Foundation/Darwin/Network only — no AppKit/UIKit/Virtualization in here.
+      - path: Shared/Sources
       - path: KakaPlayer/Resources
         buildPhase: resources
     dependencies:
@@ -46,6 +49,8 @@ targets:
             LSHandlerRank: Owner
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: "KakaPlayer shares the Ace Stream engine with your iPhone or iPad on the local network."
+        NSBonjourServices: [_kakaplayer._tcp]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.kakaplayer.KakaPlayer

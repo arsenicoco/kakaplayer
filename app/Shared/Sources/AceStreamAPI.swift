@@ -3,6 +3,9 @@ import Foundation
 /// Minimal client for the Ace Stream engine HTTP API (reached via the local proxy).
 struct AceStreamAPI {
     var baseURL = URL(string: "http://127.0.0.1:6878")!
+    /// A stable per-client pid keeps the engine from treating every reconnect as a new
+    /// client. Injectable so that several clients of one engine can stay distinct.
+    var pid: String = "kakaplayer"
     private let session: URLSession = {
         let c = URLSessionConfiguration.ephemeral
         c.timeoutIntervalForRequest = 30
@@ -13,9 +16,11 @@ struct AceStreamAPI {
 
     struct EngineVersion: Decodable { let version: String; let code: Int?; let platform: String? }
     struct PlaybackInfo: Decodable {
-        let playback_url: String
-        let stat_url: String
-        let command_url: String
+        // var, not let: the engine fills these in with its own loopback address, which
+        // `startStream` rewrites to the host we reached the engine on.
+        var playback_url: String
+        var stat_url: String
+        var command_url: String
         let infohash: String?
         let playback_session_id: String?
         let is_live: Int?
@@ -64,10 +69,24 @@ struct AceStreamAPI {
         case .infohash: items.append(.init(name: "infohash", value: link.value))
         case .url: items.append(.init(name: "url", value: link.value))
         }
-        // A stable per-app pid keeps the engine from treating every reconnect as a new client.
-        items.append(.init(name: "pid", value: "kakaplayer"))
+        items.append(.init(name: "pid", value: pid))
         let path = hls ? "ace/manifest.m3u8" : "ace/getstream"
-        return try await get(baseURL.appendingPathComponent(path).appending(queryItems: items), as: PlaybackInfo.self)
+        var info = try await get(baseURL.appendingPathComponent(path).appending(queryItems: items), as: PlaybackInfo.self)
+        info.playback_url = Self.rewritingLoopback(info.playback_url, to: baseURL)
+        info.stat_url = Self.rewritingLoopback(info.stat_url, to: baseURL)
+        info.command_url = Self.rewritingLoopback(info.command_url, to: baseURL)
+        return info
+    }
+
+    /// The engine reports its URLs as `http://127.0.0.1:6878/...` (or `localhost`, `::1`)
+    /// regardless of the address we reached it on. Point them back at `base`'s host and
+    /// port, keeping scheme, path and query. Loopback `base`es come out unchanged in
+    /// effect, and anything unparseable is returned untouched.
+    static func rewritingLoopback(_ url: String, to base: URL) -> String {
+        guard let parsed = URL(string: url),
+              let retargeted = LoopbackRewrite.retargeted(parsed, to: base)
+        else { return url }
+        return retargeted.absoluteString
     }
 
     func stats(_ info: PlaybackInfo) async throws -> Stats {

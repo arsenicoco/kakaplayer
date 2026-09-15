@@ -46,10 +46,16 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_kakaplayer._tcp</string>
+	</array>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>MIT. Bundles VLCKit (LGPL 2.1) and the Ace Stream engine (Ace Stream user agreement).</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>KakaPlayer shares the Ace Stream engine with your iPhone or iPad on the local network.</string>
 	<key>NSSupportsAutomaticTermination</key>
 	<false/>
 	<key>NSSupportsSuddenTermination</key>
