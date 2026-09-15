@@ -23,10 +23,23 @@ struct KakaPlayerApp: App {
                 Button("Restart Engine") { appDelegate.model.shutdown(); appDelegate.model.startEngine() }
                 Button("Reset Engine Image…") { appDelegate.model.shutdown(); appDelegate.model.startEngine(reinstall: true) }
                 Divider()
+                LANSharingMenuItem(model: appDelegate.model)
+                Divider()
                 Button("Show Log") { appDelegate.model.showLog.toggle() }
                     .keyboardShortcut("l", modifiers: [.command, .shift])
             }
         }
+    }
+}
+
+/// The checkmark item for LAN sharing. It needs its own `@ObservedObject` because
+/// a `commands` builder isn't part of the view hierarchy and wouldn't otherwise
+/// redraw when the toggle changes.
+private struct LANSharingMenuItem: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        Toggle("Share Engine on Local Network", isOn: $model.lanSharingEnabled)
     }
 }
 

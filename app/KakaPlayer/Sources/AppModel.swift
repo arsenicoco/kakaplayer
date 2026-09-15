@@ -69,6 +69,19 @@ final class AppModel: ObservableObject {
     @Published var showLog = false
     @Published var showHelp = false
 
+    // Sharing the engine with other devices on the local network. Off by default;
+    // the choice is remembered across launches.
+    private static let lanSharingDefaultsKey = "lanSharing.enabled"
+    @Published var lanSharingEnabled: Bool = UserDefaults.standard.bool(forKey: AppModel.lanSharingDefaultsKey) {
+        didSet {
+            guard oldValue != lanSharingEnabled else { return }
+            UserDefaults.standard.set(lanSharingEnabled, forKey: Self.lanSharingDefaultsKey)
+            applyLANSharing()
+        }
+    }
+    /// `192.168.1.20:6878` while sharing, for the status line.
+    @Published var lanAddress: String?
+
     // Audio / transport, driven by the toolbar and keyboard shortcuts.
     @Published var volume: Double = 100
     @Published var muted = false
@@ -102,6 +115,9 @@ final class AppModel: ObservableObject {
     private var statsTask: Task<Void, Never>?
     private var startTask: Task<Void, Never>?
     private let maxLogLines = 2000
+    private lazy var lanSharing = LanSharing { [weak self] line in
+        Task { @MainActor in self?.appendLog(line) }
+    }
 
     init() {
         VLCLogBridge.sink = { [weak self] line in Task { @MainActor in self?.appendLog(line) } }
@@ -212,6 +228,7 @@ final class AppModel: ObservableObject {
             guard let version else { throw VMController.VMError.timeout("engine did not answer within 3 minutes (see log)") }
             engineState = .ready(version: version)
             appendLog("[app] engine ready, version \(version)")
+            applyLANSharing()
             if let link = pendingLink {
                 pendingLink = nil
                 play(link)
@@ -222,8 +239,36 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Brings LAN sharing in line with the toggle and the engine state. Sharing can
+    /// only run once the engine answers, so the toggle is re-applied on every start.
+    private func applyLANSharing() {
+        guard lanSharingEnabled else {
+            lanSharing.stop()
+            lanAddress = nil
+            return
+        }
+        guard case .ready(let version) = engineState, let proxy else {
+            lanAddress = nil   // picked up again when the engine becomes ready
+            return
+        }
+        guard !lanSharing.isSharing else {
+            lanAddress = lanSharing.address
+            return
+        }
+        do {
+            try lanSharing.start(proxy: proxy, engineVersion: version)
+            lanAddress = lanSharing.address
+            appendLog("[lan] sharing engine on \(lanAddress ?? "the local network")")
+        } catch {
+            appendLog("[lan] could not start sharing: \(error.localizedDescription)")
+            lanSharingEnabled = false
+        }
+    }
+
     func shutdown() {
         stopPlayback()
+        lanSharing.stop()
+        lanAddress = nil
         proxy?.stop()
         proxy = nil
         vm.shutdown()
