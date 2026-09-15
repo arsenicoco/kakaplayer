@@ -211,12 +211,17 @@ final class MobileModel: ObservableObject {
         api = engineURL.map { AceStreamAPI(baseURL: $0, pid: Self.clientPID) }
         appendLog("[app] engine set to \(engineURL?.absoluteString ?? "none")")
         // Cancelling is cooperative and `stopPlayback` leaves its "tell the engine to
-        // stop" request in flight, both on the *old* client. Wait for the two of them to
-        // finish before retiring the session under them.
+        // stop" request in flight, so wait for everything still holding a copy of the old
+        // client before retiring the session under it. `checkTask` is captured here, ahead
+        // of the `checkEngine()` below that replaces it: two quick changes of address in a
+        // row would otherwise invalidate a client whose probe had not issued its request
+        // yet, and a request started on an invalidated session kills the process.
         let pendingStop = stopTask
+        let pendingCheck = checkTask
         Task {
             _ = await pendingStats?.value
             _ = await pendingStop?.value
+            _ = await pendingCheck?.value
             previousAPI?.invalidate()
         }
         checkEngine()
@@ -554,6 +559,13 @@ final class MobileModel: ObservableObject {
         // the audio route can actually be handed back.
         if case .stopped = event {
             appendLog("[vlc] player released the media")
+            // Only when playback is really over. A restart — a different link, an upstream
+            // death, coming back from the background — clears `playbackURL` too, so the
+            // player reports `.stopped` for the *old* stream after `play()` has already
+            // claimed the audio route for the new one. Releasing it here would leave the
+            // new stream running with no route. `stopPlayback` sets `.stopped` before the
+            // event can arrive; `play()` sets `.starting`.
+            guard playbackState == .stopped else { return }
             audioReleaseTask?.cancel()
             audioReleaseTask = nil
             deactivateAudioSession()
