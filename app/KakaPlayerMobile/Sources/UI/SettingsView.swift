@@ -1,15 +1,20 @@
 import SwiftUI
 
-/// Engine address entry. A later task adds discovered (Bonjour) engines above the manual
-/// fields, so the manual form stays deliberately small.
+/// Engine address entry: the engines found on this network over Bonjour, and — for
+/// anything discovery cannot see — a deliberately small manual form under them.
 struct SettingsView: View {
     @EnvironmentObject var model: MobileModel
     @Environment(\.dismiss) private var dismiss
+
+    @StateObject private var discovery = EngineDiscovery()
 
     @State private var host: String = ""
     @State private var port: String = ""
     @State private var testResult: TestResult = .none
     @State private var testing = false
+    /// Set once, when a lone engine was picked without the user asking.
+    @State private var autoSelected: String?
+    @State private var didAutoSelect = false
 
     private enum TestResult: Equatable {
         case none
@@ -54,6 +59,9 @@ struct SettingsView: View {
                         .font(MobileTheme.rounded(12))
                         .foregroundStyle(MobileTheme.textSecondary)
 
+                    nearbySection
+
+                    sectionTitle("Or type the address")
                     field(title: "Host", text: $host, placeholder: "192.168.1.10", keyboard: .URL)
                     field(title: "Port", text: $port, placeholder: "\(MobileModel.defaultPort)", keyboard: .numberPad)
 
@@ -108,7 +116,97 @@ struct SettingsView: View {
         .onAppear {
             host = model.engineHost
             port = String(model.enginePort)
+            discovery.start()
         }
+        .onDisappear { discovery.stop() }
+        .onChange(of: discovery.engines) { _, engines in autoSelectLoneEngine(engines) }
+    }
+
+    // MARK: Nearby engines
+
+    @ViewBuilder
+    private var nearbySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("Nearby engines")
+
+            ForEach(discovery.engines) { engine in
+                Button { select(engine) } label: { engineRow(engine) }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Use \(engine.name) at \(engine.address)")
+            }
+
+            if discovery.engines.isEmpty && discovery.isBrowsing {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small).tint(MobileTheme.textTertiary)
+                    Text("Searching…").font(MobileTheme.rounded(12)).foregroundStyle(MobileTheme.textTertiary)
+                }
+                .frame(height: 28)
+            }
+
+            if let status = discovery.statusText {
+                resultLine("wifi.exclamationmark", status, MobileTheme.warn)
+            }
+            if let autoSelected {
+                resultLine("checkmark.circle.fill", "Using \(autoSelected) — the only engine on this network.", MobileTheme.ok)
+            }
+        }
+    }
+
+    private func engineRow(_ engine: DiscoveredEngine) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "desktopcomputer")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(MobileTheme.accent)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(engine.name)
+                    .font(MobileTheme.rounded(14, .semibold))
+                    .foregroundStyle(MobileTheme.textPrimary)
+                    .lineLimit(1)
+                Text(engine.version.map { "\(engine.address) · \($0)" } ?? engine.address)
+                    .font(MobileTheme.rounded(11).monospacedDigit())
+                    .foregroundStyle(MobileTheme.textSecondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Image(systemName: "chevron.right")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(MobileTheme.textTertiary)
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 56)
+        .frame(maxWidth: .infinity)
+        .background(MobileTheme.bgElevated, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .strokeBorder(MobileTheme.stroke, lineWidth: 1))
+        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    /// Picking a discovered engine is the whole point of the screen, so it saves and
+    /// leaves rather than only filling the fields in and waiting for "Save".
+    private func select(_ engine: DiscoveredEngine) {
+        host = engine.host
+        port = String(engine.port)
+        model.setEngine(host: engine.host, port: engine.port)
+        dismiss()
+    }
+
+    /// With nothing configured and exactly one engine on the network there is no choice
+    /// to make, so make it — once, and visibly. The sheet stays open: the user opened it
+    /// on purpose and may want the manual fields anyway.
+    private func autoSelectLoneEngine(_ engines: [DiscoveredEngine]) {
+        guard !didAutoSelect, model.engineHost.isEmpty,
+              engines.count == 1, let engine = engines.first else { return }
+        didAutoSelect = true
+        host = engine.host
+        port = String(engine.port)
+        model.setEngine(host: engine.host, port: engine.port)
+        autoSelected = engine.name
+    }
+
+    private func sectionTitle(_ text: String) -> some View {
+        Text(text)
+            .font(MobileTheme.rounded(12, .semibold))
+            .foregroundStyle(MobileTheme.textTertiary)
     }
 
     private func field(title: String, text: Binding<String>, placeholder: String, keyboard: UIKeyboardType) -> some View {
