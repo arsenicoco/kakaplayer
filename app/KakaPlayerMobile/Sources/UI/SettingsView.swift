@@ -15,6 +15,8 @@ struct SettingsView: View {
     /// Set once, when a lone engine was picked without the user asking.
     @State private var autoSelected: String?
     @State private var didAutoSelect = false
+    /// The pending "the list has settled, is there exactly one?" check.
+    @State private var autoSelectTask: Task<Void, Never>?
 
     private enum TestResult: Equatable {
         case none
@@ -118,8 +120,15 @@ struct SettingsView: View {
             port = String(model.enginePort)
             discovery.start()
         }
-        .onDisappear { discovery.stop() }
-        .onChange(of: discovery.engines) { _, engines in autoSelectLoneEngine(engines) }
+        .onDisappear {
+            discovery.stop()
+            autoSelectTask?.cancel()
+            autoSelectTask = nil
+        }
+        // Both, not just `engines`: a straggling resolution that fails never changes the
+        // list, and `isResolving` going false is the only sign the list has settled.
+        .onChange(of: discovery.engines) { _, _ in scheduleAutoSelect() }
+        .onChange(of: discovery.isResolving) { _, _ in scheduleAutoSelect() }
     }
 
     // MARK: Nearby engines
@@ -135,7 +144,7 @@ struct SettingsView: View {
                     .accessibilityLabel("Use \(engine.name) at \(engine.address)")
             }
 
-            if discovery.engines.isEmpty && discovery.isBrowsing {
+            if discovery.engines.isEmpty && discovery.isBrowsing && discovery.statusText == nil {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small).tint(MobileTheme.textTertiary)
                     Text("Searching…").font(MobileTheme.rounded(12)).foregroundStyle(MobileTheme.textTertiary)
@@ -190,12 +199,34 @@ struct SettingsView: View {
         dismiss()
     }
 
-    /// With nothing configured and exactly one engine on the network there is no choice
-    /// to make, so make it — once, and visibly. The sheet stays open: the user opened it
-    /// on purpose and may want the manual fields anyway.
-    private func autoSelectLoneEngine(_ engines: [DiscoveredEngine]) {
-        guard !didAutoSelect, model.engineHost.isEmpty,
-              engines.count == 1, let engine = engines.first else { return }
+    /// Waits for the list to stop moving before considering an automatic pick. Two Macs
+    /// rarely resolve in the same instant, and acting on the first one to land would save
+    /// it and then claim it was "the only engine on this network" next to a second row.
+    private func scheduleAutoSelect() {
+        guard !didAutoSelect else { return }
+        autoSelectTask?.cancel()
+        autoSelectTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1.5))
+            guard !Task.isCancelled else { return }
+            autoSelectLoneEngine()
+        }
+    }
+
+    /// With nothing configured, nothing typed and exactly one engine on the network there
+    /// is no choice to make, so make it — once, and visibly. The sheet stays open: the
+    /// user opened it on purpose and may want the manual fields anyway.
+    ///
+    /// The typing and testing guards matter as much as the configured one: a discovery
+    /// result can land at any moment, and silently overwriting a half-typed address (or
+    /// the address someone is in the middle of testing) is worse than not helping at all.
+    private func autoSelectLoneEngine() {
+        guard !didAutoSelect,
+              !discovery.isResolving,
+              model.engineHost.isEmpty,
+              host.trimmingCharacters(in: .whitespaces).isEmpty,
+              !testing,
+              discovery.engines.count == 1,
+              let engine = discovery.engines.first else { return }
         didAutoSelect = true
         host = engine.host
         port = String(engine.port)

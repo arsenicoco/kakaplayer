@@ -17,7 +17,9 @@ struct DiscoveredEngine: Identifiable, Equatable {
     /// itself changing, so this is the one part of an entry that is refreshed in place.
     fileprivate(set) var version: String?
 
-    var address: String { "\(host):\(port)" }
+    /// For display. An IPv6 literal gets the brackets it is always written with, so
+    /// "::1" and its port do not run together into "::1:6878".
+    var address: String { host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)" }
 }
 
 /// Browses for `_kakaplayer._tcp` and resolves every hit to a concrete `host:port`, so
@@ -34,19 +36,33 @@ struct DiscoveredEngine: Identifiable, Equatable {
 final class EngineDiscovery: ObservableObject {
 
     static let serviceType = "_kakaplayer._tcp"
-    /// A dead advertisement (a Mac that slept mid-browse) must not leave a spinner behind.
+    /// How long one resolution attempt gets before it is abandoned. A dead advertisement
+    /// (a Mac that slept mid-browse) must not leave a spinner behind, and the retry that
+    /// drops the IPv4 preference is on the far side of this.
     private static let resolveTimeout = 5
 
     @Published private(set) var engines: [DiscoveredEngine] = []
     @Published private(set) var isBrowsing = false
+    /// True while at least one service is still being resolved to an address. The list is
+    /// not settled until this goes false, which is what stops a caller from treating a
+    /// half-resolved network as "there is only one engine here".
+    @Published private(set) var isResolving = false
     /// A line to show the user when browsing is not simply working: the Local Network
     /// permission prompt was denied, or the browser failed outright. `nil` when fine.
     @Published private(set) var statusText: String?
 
+    /// A resolution in flight: the throwaway connection, plus the deadline that gives up
+    /// on it. `NWConnection` has no usable "I will never connect" state of its own (see
+    /// `resolverStateChanged`), so the deadline is the only thing that bounds this.
+    private struct Resolver {
+        let connection: NWConnection
+        var deadline: Task<Void, Never>?
+    }
+
     private var browser: NWBrowser?
     /// In-flight resolutions, keyed the same way `engines` are, so a second round of
     /// browse results does not start a duplicate connection for a service already known.
-    private var resolvers: [String: NWConnection] = [:]
+    private var resolvers: [String: Resolver] = [:]
     private let log: (String) -> Void
 
     init(log: @escaping (String) -> Void = { FileLog.shared.write($0) }) {
@@ -55,7 +71,10 @@ final class EngineDiscovery: ObservableObject {
 
     deinit {
         browser?.cancel()
-        for connection in resolvers.values { connection.cancel() }
+        for resolver in resolvers.values {
+            resolver.deadline?.cancel()
+            resolver.connection.cancel()
+        }
     }
 
     // MARK: Browsing
@@ -136,20 +155,18 @@ final class EngineDiscovery: ObservableObject {
 
         for (key, result) in live {
             let version = Self.txtValue("version", from: result.metadata)
+            let name = Self.displayName(result.endpoint, fallback: key)
             if let index = engines.firstIndex(where: { $0.id == key }) {
                 engines[index].version = version          // a re-published TXT record
-            } else if resolvers[key] == nil {
-                resolve(result, key: key, version: version)
+            } else if resolvers[key] == nil, !engines.contains(where: { $0.name == name }) {
+                // The name check keeps the *other* endpoint of a Mac that is visible over
+                // two interfaces from being resolved just to be deduplicated away again.
+                connect(to: result.endpoint, key: key, name: name, version: version, preferIPv4: true)
             }
         }
     }
 
     // MARK: Resolution
-
-    private func resolve(_ result: NWBrowser.Result, key: String, version: String?) {
-        let name = Self.serviceName(result.endpoint) ?? key
-        connect(to: result.endpoint, key: key, name: name, version: version, preferIPv4: true)
-    }
 
     /// Opens a throwaway connection purely to learn the address behind the service.
     ///
@@ -165,13 +182,22 @@ final class EngineDiscovery: ObservableObject {
             (parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options)?.version = .v4
         }
         let connection = NWConnection(to: endpoint, using: parameters)
-        resolvers[key] = connection
+        resolvers[key] = Resolver(connection: connection)
+        isResolving = true
         connection.stateUpdateHandler = { [weak self, weak connection] state in
             Task { @MainActor in
                 guard let self, let connection else { return }
                 self.resolverStateChanged(state, connection: connection, endpoint: endpoint,
                                           key: key, name: name, version: version, preferIPv4: preferIPv4)
             }
+        }
+        // Armed before `start()` so a connection that answers instantly cannot be caught
+        // by its own deadline: `finishResolving` cancels whatever is stored here.
+        resolvers[key]?.deadline = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.resolveTimeout))
+            guard !Task.isCancelled, let self, self.resolvers[key] != nil else { return }
+            self.giveUp(on: endpoint, key: key, name: name, version: version,
+                        preferIPv4: preferIPv4, reason: "no answer within \(Self.resolveTimeout)s")
         }
         connection.start(queue: .main)
     }
@@ -180,7 +206,7 @@ final class EngineDiscovery: ObservableObject {
                                       endpoint: NWEndpoint, key: String, name: String,
                                       version: String?, preferIPv4: Bool) {
         // A late callback from a connection we already tore down must not revive it.
-        guard resolvers[key] === connection else { return }
+        guard resolvers[key]?.connection === connection else { return }
         switch state {
         case .ready:
             let remote = connection.currentPath?.remoteEndpoint
@@ -191,17 +217,21 @@ final class EngineDiscovery: ObservableObject {
             }
             add(DiscoveredEngine(id: key, name: name, host: address, port: Int(port.rawValue), version: version))
             log("[discovery] \(name) at \(address):\(port.rawValue)\(version.map { " version \($0)" } ?? "")")
-        case .waiting:
-            // No route to the advertiser yet. `connectionTimeout` turns a hopeless wait
-            // into `.failed`, so there is nothing to do but let it run out.
-            break
-        case .failed(let error):
-            finishResolving(key)
+        case .waiting(let error):
+            // `.waiting`, not `.failed`, is how an unreachable or refused peer is reported,
+            // and the connection sits there retrying — `connectionTimeout` does not promote
+            // it. A pinned attempt against an advertiser with no IPv4 address may not even
+            // get this far: measured, it simply never leaves `.preparing`, which is why the
+            // deadline above exists. Both roads lead to the same fallback.
             if preferIPv4 {
-                connect(to: endpoint, key: key, name: name, version: version, preferIPv4: false)
-            } else {
-                log("[discovery] could not resolve \(name): \(error)")
+                giveUp(on: endpoint, key: key, name: name, version: version,
+                       preferIPv4: true, reason: "\(error)")
             }
+            // Unpinned there is nothing better to switch to, and a wait can still come
+            // good once an interface finishes coming up, so let the deadline end it.
+        case .failed(let error):
+            giveUp(on: endpoint, key: key, name: name, version: version,
+                   preferIPv4: preferIPv4, reason: "\(error)")
         case .cancelled:
             finishResolving(key)
         default:
@@ -209,18 +239,35 @@ final class EngineDiscovery: ObservableObject {
         }
     }
 
-    /// Cancels and forgets a resolver, clearing its handler so the connection does not
-    /// keep this object (and itself) alive through the closure.
+    /// Abandons the current attempt: retries without the IPv4 preference if that is what
+    /// was in the way, and otherwise drops the service until the browser reports it again.
+    private func giveUp(on endpoint: NWEndpoint, key: String, name: String, version: String?,
+                        preferIPv4: Bool, reason: String) {
+        finishResolving(key)
+        if preferIPv4 {
+            log("[discovery] \(name) did not answer over IPv4 (\(reason)); retrying without the preference")
+            connect(to: endpoint, key: key, name: name, version: version, preferIPv4: false)
+        } else {
+            log("[discovery] gave up resolving \(name): \(reason)")
+        }
+    }
+
+    /// Cancels and forgets a resolver — its deadline, and its connection's handler, so the
+    /// connection does not keep this object (and itself) alive through the closure.
     private func finishResolving(_ key: String) {
-        guard let connection = resolvers.removeValue(forKey: key) else { return }
-        connection.stateUpdateHandler = nil
-        connection.cancel()
+        guard let resolver = resolvers.removeValue(forKey: key) else { return }
+        resolver.deadline?.cancel()
+        resolver.connection.stateUpdateHandler = nil
+        resolver.connection.cancel()
+        isResolving = !resolvers.isEmpty
     }
 
     private func add(_ engine: DiscoveredEngine) {
-        // The same Mac reached over two interfaces resolves to the same address twice;
-        // show it once.
-        engines.removeAll { $0.id == engine.id || ($0.host == engine.host && $0.port == engine.port) }
+        // One Mac can be browsed twice — over Wi-Fi and over AWDL — as two endpoints with
+        // the same Bonjour instance name and *different* addresses, so the name is what
+        // identifies the machine. Collapsing them also keeps "the only engine on this
+        // network" from being said next to a two-row list.
+        engines.removeAll { $0.id == engine.id || $0.name == engine.name }
         engines.append(engine)
         engines.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
@@ -229,9 +276,11 @@ final class EngineDiscovery: ObservableObject {
 
     static func key(for endpoint: NWEndpoint) -> String { String(describing: endpoint) }
 
-    static func serviceName(_ endpoint: NWEndpoint) -> String? {
+    /// The Bonjour instance name, which is also how one machine found over two interfaces
+    /// is recognised as one machine.
+    static func displayName(_ endpoint: NWEndpoint, fallback: String) -> String {
         if case .service(let name, _, _, _) = endpoint { return name }
-        return nil
+        return fallback
     }
 
     static func txtValue(_ key: String, from metadata: NWBrowser.Result.Metadata) -> String? {
