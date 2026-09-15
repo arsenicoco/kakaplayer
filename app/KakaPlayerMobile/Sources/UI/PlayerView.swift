@@ -19,6 +19,9 @@ struct PlayerView: UIViewRepresentable {
     let attempt: Int
     let volume: Int32
     let paused: Bool
+    /// `false` letterboxes the video inside the view, `true` crops it to fill — the
+    /// difference between black bars and a 16:9 stream filling a 19.5:9 phone in landscape.
+    var aspectFill: Bool = false
     let onEvent: (PlayerEvent) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(onEvent: onEvent) }
@@ -32,7 +35,7 @@ struct PlayerView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: UIView, context: Context) {
-        context.coordinator.update(url: url, attempt: attempt, volume: volume, paused: paused)
+        context.coordinator.update(url: url, attempt: attempt, volume: volume, paused: paused, aspectFill: aspectFill)
     }
 
     static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) {
@@ -44,6 +47,7 @@ struct PlayerView: UIViewRepresentable {
         private var currentURL: URL?
         private var currentAttempt = -1
         private var currentPaused = false
+        private var currentAspectFill: Bool?
         private let onEvent: (PlayerEvent) -> Void
 
         init(onEvent: @escaping (PlayerEvent) -> Void) { self.onEvent = onEvent }
@@ -51,15 +55,15 @@ struct PlayerView: UIViewRepresentable {
         func attach(view: UIView) {
             VLCLogBridge.install()
             let p = VLCMediaPlayer()
-            // No aspect ratio is forced, so libvlc letterboxes the video into the view.
             p.drawable = view
             p.delegate = self
             player = p
         }
 
-        func update(url: URL?, attempt: Int, volume: Int32, paused: Bool) {
+        func update(url: URL?, attempt: Int, volume: Int32, paused: Bool, aspectFill: Bool) {
             guard let player else { return }
             player.audio?.volume = volume
+            applyFit(aspectFill, to: player)
             if url != currentURL || attempt != currentAttempt {
                 currentURL = url
                 currentAttempt = attempt
@@ -72,6 +76,10 @@ struct PlayerView: UIViewRepresentable {
                     ])
                     player.media = media
                     player.play()
+                    // A fresh vout starts from the player's own fit mode; re-assert ours so
+                    // a reopened stream does not snap back to letterbox.
+                    currentAspectFill = nil
+                    applyFit(aspectFill, to: player)
                 } else {
                     player.stop()
                 }
@@ -79,6 +87,16 @@ struct PlayerView: UIViewRepresentable {
                 currentPaused = paused
                 if paused { player.pause() } else { player.play() }
             }
+        }
+
+        /// VLCKit 4's `videoFitMode` does the cropping for us: `.smaller` fits the whole
+        /// frame inside the view (letterbox), `.larger` fills it and lets the overflow be
+        /// clipped by the container. Nothing here touches `videoAspectRatio` — that
+        /// *stretches* the picture rather than cropping it, which is not what fill means.
+        private func applyFit(_ aspectFill: Bool, to player: VLCMediaPlayer) {
+            guard currentAspectFill != aspectFill else { return }
+            currentAspectFill = aspectFill
+            player.videoFitMode = aspectFill ? .larger : .smaller
         }
 
         func stop() {

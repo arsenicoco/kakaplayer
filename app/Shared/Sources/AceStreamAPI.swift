@@ -98,6 +98,17 @@ struct AceStreamAPI {
         guard let url = URL(string: info.command_url)?.appending(queryItems: [.init(name: "method", value: "stop")]) else { return }
         _ = try? await session.data(from: url)
     }
+
+    /// Finishes this client's URLSession once its in-flight requests are done.
+    ///
+    /// A URLSession retains itself until it is invalidated, so a client that is dropped
+    /// without this call leaks its session and the keep-alive connections it holds to the
+    /// engine. Call it whenever a client is discarded — a re-pointed engine address, or a
+    /// throwaway client built just to probe an address. Copies of the struct share one
+    /// session, so the invalidated client (and every copy of it) is done for good.
+    func invalidate() {
+        session.finishTasksAndInvalidate()
+    }
 }
 
 /// A parsed acestream link: `acestream://<40 hex>`, a bare content id / infohash,
