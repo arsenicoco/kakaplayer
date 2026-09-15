@@ -194,10 +194,17 @@ final class StreamRelay: NSObject, URLSessionDataDelegate {
                     newRequest request: URLRequest,
                     completionHandler: @escaping (URLRequest?) -> Void) {
         lock.lock(); let upstream = upstreamURL; lock.unlock()
-        guard let upstream, !LoopbackRewrite.isLoopback(upstream.host),
-              let url = request.url,
-              let retargeted = LoopbackRewrite.retargeted(url, to: upstream)
-        else {
+        // A loopback upstream is the engine-on-this-Mac case: nothing to retarget.
+        guard let upstream, !LoopbackRewrite.isLoopback(upstream.host), let url = request.url else {
+            completionHandler(request)
+            return
+        }
+        guard let retargeted = LoopbackRewrite.retargeted(url, to: upstream) else {
+            // Redirects that already point off-loopback are ordinary; a loopback one we
+            // failed to rebuild is not, and would send us to our own loopback.
+            if LoopbackRewrite.isLoopback(url.host) {
+                log("[relay] could not retarget redirect \(url.absoluteString) at \(upstream.host ?? "?"), following as-is")
+            }
             completionHandler(request)
             return
         }
