@@ -11,6 +11,7 @@ final class StreamRelay: NSObject, URLSessionDataDelegate {
     private var session: URLSession?
     private var task: URLSessionDataTask?
     private let lock = NSLock()
+    private var upstreamURL: URL?                // guarded by `lock`
     private var clients: [Client] = []
     private var recent = Data()                  // last ~1.5 MB, sent first to late joiners
     private let recentLimit = 1_500_000
@@ -61,6 +62,7 @@ final class StreamRelay: NSObject, URLSessionDataDelegate {
         cfg.waitsForConnectivity = false
         let s = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
         session = s
+        lock.lock(); upstreamURL = upstream; lock.unlock()
         var req = URLRequest(url: upstream)
         req.setValue("KakaPlayer", forHTTPHeaderField: "User-Agent")
         let task = s.dataTask(with: req)
@@ -180,6 +182,29 @@ final class StreamRelay: NSObject, URLSessionDataDelegate {
             c.pending += data.count
             send(data, to: c)
         }
+    }
+
+    /// The engine answers `/ace/r/...` with a 302 to `/content/...` built from its own
+    /// loopback address. A client on another device that followed that literally would
+    /// land on its *own* loopback, so keep the redirect on the host we dialled. Redirects
+    /// that are already off-loopback, or that we cannot rebuild, are followed unchanged.
+    func urlSession(_ session: URLSession,
+                    task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        lock.lock(); let upstream = upstreamURL; lock.unlock()
+        guard let upstream, !LoopbackRewrite.isLoopback(upstream.host),
+              let url = request.url,
+              let retargeted = LoopbackRewrite.retargeted(url, to: upstream)
+        else {
+            completionHandler(request)
+            return
+        }
+        var rewritten = request
+        rewritten.url = retargeted
+        log("[relay] redirect to \(url.absoluteString) retargeted at \(retargeted.absoluteString)")
+        completionHandler(rewritten)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
